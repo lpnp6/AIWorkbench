@@ -7,6 +7,7 @@ Celery task) and the concrete dependencies are supplied by the caller.
 """
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 from urllib.parse import unquote, urlparse
 
@@ -17,6 +18,8 @@ from .parser import DocumentParser
 
 if TYPE_CHECKING:
     from ..adapters.source_reader import SourceReaderRegistry
+
+LOG = logging.getLogger("py_parse.parse_task")
 
 
 def run_parse_task(
@@ -29,11 +32,22 @@ def run_parse_task(
 ) -> None:
     """Execute one parse task end-to-end.
 
-    Marks the task RUNNING, reads the source, extracts, chunks, and persists the
-    result. On a domain error it records the failure and re-raises (so the queue
-    engine sees the task as failed too).
+    Atomically claims the task (PENDING → RUNNING), reads the source, extracts,
+    chunks, and persists the result. On a domain error it records the failure
+    and re-raises (so the queue engine sees the task as failed too).
+
+    If the claim fails, the task is already running or finished — a redelivered
+    or duplicated queue message. Parsing is expensive, so this is a no-op: ack
+    and return. The trade-off is that a worker killed mid-parse leaves the task
+    RUNNING until an operator (or a future reaper) resolves it; that is
+    deliberate, because re-running a half-finished parse is not free.
     """
-    store.set_running(task_id)
+    if not store.try_claim(task_id):
+        LOG.info(
+            "task %s already claimed or finished; skipping duplicate delivery",
+            task_id,
+        )
+        return
     try:
         reader = registry.resolve(source)   # raises UnsupportedSchemeError
         stream = reader.read(source)        # raises SourceReadError

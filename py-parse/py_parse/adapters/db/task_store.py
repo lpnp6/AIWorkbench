@@ -15,6 +15,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 
 import redis as redis_lib
+from sqlalchemy import func, update
 from sqlalchemy.orm import Session
 
 from ...domain.models import Chunk, ChunkMetadata, DocMeta
@@ -97,11 +98,33 @@ class RedisPostgresTaskStore(TaskStore):
         )
         self._redis.expire(_TASK_KEY.format(task_id=task_id), self._ttl)
 
-    def set_running(self, task_id: str) -> None:
+    def try_claim(self, task_id: str) -> bool:
+        # Single guarded UPDATE: PostgreSQL row locking serializes concurrent
+        # deliveries, so exactly one caller observes rowcount == 1. RUNNING is
+        # persisted here rather than only cached, which also keeps the durable
+        # store truthful when Redis keys expire mid-task.
+        with self._sessions() as s:
+            result = s.execute(
+                update(TaskRow)
+                .where(
+                    TaskRow.task_id == task_id,
+                    TaskRow.status == TaskStatus.PENDING.value,
+                )
+                .values(status=TaskStatus.RUNNING.value, updated_at=func.now())
+            )
+            claimed = result.rowcount == 1
+            s.commit()
+        if not claimed:
+            return False
+        key = _TASK_KEY.format(task_id=task_id)
         self._redis.hset(
-            _TASK_KEY.format(task_id=task_id),
+            key,
             mapping={"status": TaskStatus.RUNNING.value, "updated_at": _now()},
         )
+        # The hash may have expired while the task waited in the queue; refresh
+        # the TTL so a re-created key cannot become immortal.
+        self._redis.expire(key, self._ttl)
+        return True
 
     def set_failed(self, task_id: str, error: str) -> None:
         with self._sessions() as s:
@@ -110,14 +133,16 @@ class RedisPostgresTaskStore(TaskStore):
                 task.status = TaskStatus.FAILED.value
                 task.error = error
                 s.commit()
+        key = _TASK_KEY.format(task_id=task_id)
         self._redis.hset(
-            _TASK_KEY.format(task_id=task_id),
+            key,
             mapping={
                 "status": TaskStatus.FAILED.value,
                 "error": error,
                 "updated_at": _now(),
             },
         )
+        self._redis.expire(key, self._ttl)
 
     def save_result(
         self, task_id: str, doc_id: str, source: str, doc_meta: DocMeta, chunks: list[Chunk]
@@ -157,10 +182,12 @@ class RedisPostgresTaskStore(TaskStore):
             ensure_ascii=False,
         )
         self._redis.set(_RESULT_KEY.format(task_id=task_id), result_json, ex=self._ttl)
+        key = _TASK_KEY.format(task_id=task_id)
         self._redis.hset(
-            _TASK_KEY.format(task_id=task_id),
+            key,
             mapping={"status": TaskStatus.SUCCESS.value, "updated_at": _now()},
         )
+        self._redis.expire(key, self._ttl)
 
     # ---- read (hot cache, then durable fallback) ----
 

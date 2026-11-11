@@ -43,8 +43,15 @@ class TaskStore(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def set_running(self, task_id: str) -> None:
-        """Mark a task RUNNING (worker picked it up)."""
+    def try_claim(self, task_id: str) -> bool:
+        """Atomically move a task PENDING → RUNNING; False if it was already claimed.
+
+        The transition must be a single guarded write (``WHERE status =
+        'pending'``) so concurrent or redelivered queue messages cannot start
+        the same parse twice. A False result means the task is already running
+        or finished: the caller must ack the message and return without doing
+        any work.
+        """
         raise NotImplementedError
 
     @abstractmethod

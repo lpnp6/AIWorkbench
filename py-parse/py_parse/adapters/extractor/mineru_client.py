@@ -318,6 +318,8 @@ class MineruClient(DocumentExtractor):
             if block.get("type") != "table":
                 continue
             key = cls._bbox_key(int(block.get("page_idx", 0)), block.get("bbox"))
+            if key is None:
+                continue
             html = html_by_key.get(key)
             if html:
                 block["table_body"] = html
