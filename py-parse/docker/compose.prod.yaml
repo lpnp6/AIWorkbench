@@ -1,0 +1,194 @@
+# Production stack: MinerU 4.x parsing service + py-parse async parsing stack.
+#
+# MinerU 4.1 runs as a single service:
+#   - mineru-api          : GPU parsing engine, MinerU V1 Tasks API (port 8000,
+#                           internal). MineruClient drives it directly
+#                           (create → upload → poll → download); the optional
+#                           synchronous `file-parse-server` wrapper is not used.
+#
+# py-parse async stack:
+#   - redis               : Celery broker + hot cache for task status
+#   - postgres            : EXTERNAL — provided by the repo-root compose.infra.yaml,
+#                           reached over the AIWorkbench network as "postgres"
+#   - celery-worker       : consumes the queue, runs read -> extract -> chunk
+#   - py-parse            : gRPC control plane (SubmitParse / GetResult), port 50051
+#
+# Prerequisites:
+#   - Linux or Windows WSL2 (the Docker build of MinerU has no macOS GPU support)
+#   - NVIDIA GPU (Volta+, 8GB+ VRAM recommended) with working GPU passthrough
+#     (check: docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi)
+#   - MinerU no longer publishes prebuilt images, so mineru-api is built by
+#     Dockerfile.mineru in this directory. Model weights are downloaded at build
+#     time and baked into the image (large image; the first build takes a while).
+#
+# Start:  docker compose -f ../compose.infra.yaml up -d --wait   # first, once
+#         docker compose -f docker/compose.prod.yaml up -d --build
+# Scale:  MINERU_REPLICAS controls mineru-api (GPU side), WORKER_REPLICAS
+#         controls celery-worker (CPU side). Defaults are 1 and 2.
+#         All workers compete for the same Redis queue; an idle worker takes the
+#         next task, so there are no per-GPU queues:
+#           MINERU_REPLICAS=4 WORKER_REPLICAS=4 docker compose \
+#             -f docker/compose.prod.yaml up -d --build
+#         On a single GPU, scale only the CPU-side workers and keep one engine:
+#           MINERU_REPLICAS=1 WORKER_REPLICAS=2 CELERY_WORKER_CONCURRENCY=4 \
+#             docker compose -f docker/compose.prod.yaml up -d
+#         Why: each vLLM instance must hold the 2.2GB VLM weights plus ~1.5GB of
+#         engine overhead (CUDA graphs, activations). Two instances on an 8GB card
+#         leave no usable KV cache and no room for the desktop compositor, so the
+#         second one fails to start or starts with a KV cache too small to batch.
+#         One engine with continuous batching serves every worker and is strictly
+#         faster; multiple MinerU instances only pay off across separate GPUs.
+# Health: docker compose -f docker/compose.prod.yaml exec -T mineru-api-1 \
+#           curl -fsS http://localhost:8000/v1/health
+# Docs:   https://opendatalab.github.io/MinerU/usage/quick_start
+#
+# Development/benchmark variant: compose.yaml includes this file and adds a
+# read-only mount of the host book directory to celery-worker.
+
+name: py-parse
+
+# Postgres (and any future shared infra) lives in ../compose.infra.yaml. An
+# external network lets these containers reach it by DNS while keeping the two
+# stacks as independent compose projects.
+networks:
+  default:
+    name: AIWorkbench
+    external: true
+
+x-parse-env: &parse-env
+  # Points at the MinerU engine's V1 Tasks API. With REPLICAS>1, Docker DNS
+  # spreads requests across replicas.
+  MINERU_URL: http://mineru-api:8000
+  # Per-request HTTP timeout. Large books (300+ page PDFs, image-heavy epubs)
+  # routinely need more than the old 300s default on a laptop GPU; when this
+  # fires the client abandons a parse that MinerU would otherwise finish and
+  # the task is recorded as failed. Keep it below the benchmark --task-timeout.
+  MINERU_TIMEOUT: "${MINERU_TIMEOUT:-1800}"
+  REDIS_URL: redis://redis:6379/0
+  # requirements.txt installs psycopg2-binary, so the DSN must use the psycopg2
+  # dialect. With postgresql+psycopg:// SQLAlchemy looks for psycopg 3, which is
+  # not in the image, and startup fails with ModuleNotFoundError.
+  POSTGRES_DSN: postgresql+psycopg2://postgres:postgres@postgres:5432/pyparse
+  RESULT_TTL_SECONDS: "3600"
+  # Optional: uncomment and fill in to enable the minio/s3 storage backends.
+  # MINIO_ENDPOINT: minio:9000
+  # MINIO_ACCESS_KEY: ...
+  # MINIO_SECRET_KEY: ...
+  # S3_ENDPOINT_URL: http://minio:9000
+  # S3_REGION: us-east-1
+  # S3_ACCESS_KEY: ...
+  # S3_SECRET_KEY: ...
+
+services:
+  mineru-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.mineru
+    image: mineru:4
+    # No container_name: compose generates names so replicas can scale
+    # (mineru-api-1, -2, ...).
+    restart: always
+    environment:
+      # Weights are baked into the image; nothing is downloaded at runtime.
+      MINERU_MODEL_SOURCE: local
+      TZ: Asia/Shanghai
+    entrypoint: ["mineru-kit"]
+    command:
+      - api-server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --concurrency
+      - "${MINERU_CONCURRENCY:-2}"
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/v1/health || exit 1"]
+    deploy:
+      replicas: ${MINERU_REPLICAS:-1}
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  redis:
+    image: redis:7-alpine
+    container_name: py-parse-redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Async parsing worker: consumes the Redis queue, runs read -> extract -> chunk,
+  # and writes Postgres + Redis.
+  celery-worker:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    # No container_name: compose generates names (celery-worker-1, -2, ...).
+    restart: always
+    deploy:
+      # CPU-side consumers; independent of the GPU engine count. On one GPU,
+      # keep one engine and add workers here to keep its batch full.
+      replicas: ${WORKER_REPLICAS:-2}
+    depends_on:
+      redis:
+        condition: service_healthy
+      mineru-api:
+        condition: service_healthy
+    environment:
+      <<: *parse-env
+      # Documents parsed concurrently by each worker; one replica models one GPU.
+      CELERY_WORKER_CONCURRENCY: "${CELERY_WORKER_CONCURRENCY:-1}"
+    # --prefetch-multiplier=1 is the key to a shared queue: without it every
+    # worker hoards 4 tasks, idle workers get nothing, and multi-GPU is wasted.
+    command: celery -A py_parse.adapters.queue.celery_app worker --loglevel=info --concurrency=${CELERY_WORKER_CONCURRENCY:-1} --prefetch-multiplier=1
+
+  # gRPC control plane: exposes SubmitParse / GetResult.
+  py-parse:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: py-parse
+    restart: always
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "50051:50051"
+    environment:
+      <<: *parse-env
+      GRPC_HOST: 0.0.0.0
+      GRPC_PORT: "50051"
+    healthcheck:
+      # Probe through the standard gRPC health service (grpcio-health-checking
+      # is already in the image).
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import grpc
+          from grpc_health.v1 import health_pb2, health_pb2_grpc
+          ch = grpc.insecure_channel('localhost:50051')
+          r = health_pb2_grpc.HealthStub(ch).Check(
+              health_pb2.HealthCheckRequest(), timeout=5)
+          assert r.status == health_pb2.HealthCheckResponse.SERVING
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  redis-data:

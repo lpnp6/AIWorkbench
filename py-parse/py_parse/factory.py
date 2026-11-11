@@ -10,16 +10,19 @@ import logging
 
 import redis as redis_lib
 
-from .adapters import (
+from .adapters.db import (
+    RedisPostgresTaskStore,
+    create_engine_from_dsn,
+    init_db,
+    make_session_factory,
+)
+from .adapters.extractor import MineruClient
+from .adapters.source_reader import (
     FileSourceReader,
     MinioSourceReader,
-    MineruClient,
     S3SourceReader,
     SourceReaderRegistry,
 )
-from .adapters.db import create_engine_from_dsn, init_db, make_session_factory
-from .adapters.stub_extractor import StubExtractor
-from .adapters.task_store import RedisPostgresTaskStore
 from .config import Settings
 from .domain.parser import DocumentParser
 from .ports.document_extractor import DocumentExtractor
@@ -62,9 +65,10 @@ def build_registry(settings: Settings) -> SourceReaderRegistry:
 
 
 def build_extractor(settings: Settings) -> DocumentExtractor:
-    if settings.extractor_backend == "stub":
-        return StubExtractor()
-    return MineruClient(base_url=settings.mineru_url, timeout=settings.mineru_timeout)
+    return MineruClient(
+        base_url=settings.mineru_url,
+        job_timeout=settings.mineru_timeout,
+    )
 
 
 def build_parser(settings: Settings) -> DocumentParser:

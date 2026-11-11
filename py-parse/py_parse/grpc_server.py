@@ -16,8 +16,8 @@ from concurrent import futures
 
 import grpc
 
-from .adapters.celery_queue import CeleryTaskQueue
-from .adapters.registry import SourceReaderRegistry
+from .adapters.queue.celery_queue import CeleryTaskQueue
+from .adapters.source_reader import SourceReaderRegistry
 from .config import Settings
 from .domain.models import Chunk
 from .factory import build_registry, build_store

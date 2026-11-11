@@ -8,6 +8,7 @@ Celery task) and the concrete dependencies are supplied by the caller.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from urllib.parse import unquote, urlparse
 
 from ..ports.document_extractor import DocumentExtractError
 from ..ports.source_reader import SourceReadError, UnsupportedSchemeError
@@ -15,7 +16,7 @@ from ..ports.task_store import TaskStore
 from .parser import DocumentParser
 
 if TYPE_CHECKING:
-    from ..adapters.registry import SourceReaderRegistry
+    from ..adapters.source_reader import SourceReaderRegistry
 
 
 def run_parse_task(
@@ -37,8 +38,15 @@ def run_parse_task(
         reader = registry.resolve(source)   # raises UnsupportedSchemeError
         stream = reader.read(source)        # raises SourceReadError
         with stream:
-            output = parser.parse(stream, doc_id=doc_id)   # raises DocumentExtractError
+            output = parser.parse(stream, doc_id=doc_id, filename=_source_filename(source))
         store.save_result(task_id, doc_id, source, output.doc_meta, output.chunks)
     except (UnsupportedSchemeError, SourceReadError, DocumentExtractError) as e:
         store.set_failed(task_id, str(e))
         raise
+
+
+def _source_filename(source: str) -> str:
+    """Basename of the source URI; extractors use its extension to pick a parser."""
+    path = urlparse(source).path if "://" in source else source
+    name = unquote(path.replace("\\", "/").rsplit("/", 1)[-1]).strip()
+    return name or "document.pdf"

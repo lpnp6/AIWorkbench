@@ -1,0 +1,49 @@
+# Shared infrastructure for every service in this repo.
+#
+# Lives in its own compose project so microservice stacks can be brought up,
+# torn down and rebuilt without touching durable state. Microservices join the
+# external `AIWorkbench` network and reach Postgres by its alias `postgres`.
+#
+# Start once, before any microservice stack:
+#   docker compose -f compose.infra.yaml up -d --wait
+#
+# Stop (data survives in the named volume):
+#   docker compose -f compose.infra.yaml down
+
+name: parse-infra
+
+networks:
+  AIWorkbench:
+    name: AIWorkbench      # fixed network name; microservices declare it external
+    driver: bridge
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: parse-postgres   # stable DNS name across compose projects
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: pyparse
+    ports:
+      # Host-side tools only; containers use postgres:5432 on AIWorkbench and
+      # never go through the published port.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      AIWorkbench:
+        aliases:
+          - postgres          # also reachable as postgres:5432
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d pyparse"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  # Fixed name: recreating/renaming the compose project never orphans the data.
+  pgdata:
+    name: parse-pgdata

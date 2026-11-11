@@ -17,9 +17,9 @@ from datetime import datetime, timezone
 import redis as redis_lib
 from sqlalchemy.orm import Session
 
-from ..domain.models import Chunk, ChunkMetadata, DocMeta
-from ..ports.task_store import TaskSnapshot, TaskStatus, TaskStore
-from .db import ChunkRow, TaskRow
+from ...domain.models import Chunk, ChunkMetadata, DocMeta
+from ...ports.task_store import TaskSnapshot, TaskStatus, TaskStore
+from .models import ChunkRow, TaskRow
 
 _TASK_KEY = "pyparse:task:{task_id}"
 _RESULT_KEY = "pyparse:result:{task_id}"

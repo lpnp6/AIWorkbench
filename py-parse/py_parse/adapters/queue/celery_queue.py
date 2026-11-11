@@ -6,7 +6,7 @@ traceable end-to-end under one identifier.
 """
 from __future__ import annotations
 
-from ..ports.task_queue import TaskQueue
+from ...ports.task_queue import TaskQueue
 from .tasks import parse_document
 
 

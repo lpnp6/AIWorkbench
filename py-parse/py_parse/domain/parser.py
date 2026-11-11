@@ -19,10 +19,10 @@ class DocumentParser:
     def __init__(self, extractor: DocumentExtractor) -> None:
         self._extractor = extractor
 
-    def parse(self, pdf_stream: BinaryIO, doc_id: str) -> ParseOutput:
+    def parse(self, pdf_stream: BinaryIO, doc_id: str, filename: str) -> ParseOutput:
         pdf_bytes = pdf_stream.read()
 
-        content_list = self._extractor.extract(pdf_bytes)
+        content_list = self._extractor.extract(pdf_bytes, filename)
 
         chunks: list[Chunk] = chunk_content_list(content_list, doc_id)
 

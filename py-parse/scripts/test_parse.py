@@ -1,10 +1,8 @@
 #!/usr/bin/env python
 """Validate extraction + chunking against a local MinerU service.
 
-Prerequisite: a `mineru-kit file-parse-server` wrapper running locally against a
-`mineru-kit api-server` engine (see README), e.g.
+Prerequisite: a `mineru-kit api-server` engine running locally (see README), e.g.
     mineru-kit api-server --host 127.0.0.1 --port 8000
-    mineru-kit file-parse-server --api-url http://127.0.0.1:8000 --port 8003
 
 Run from the py-parse/ directory:
     python scripts/test_parse.py /path/to/doc.pdf --doc-id sample --output-dir out
@@ -24,7 +22,7 @@ from sys import path as _sys_path
 
 _sys_path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from py_parse.adapters.mineru_client import MineruClient  # noqa: E402
+from py_parse.adapters.extractor import MineruClient  # noqa: E402
 from py_parse.domain.chunker import chunk_content_list, estimate_tokens  # noqa: E402
 from py_parse.domain.models import Chunk  # noqa: E402
 
@@ -98,7 +96,7 @@ def main() -> None:
     args = ap.parse_args()
 
     client = MineruClient(base_url=args.mineru_url)
-    content_list = client.extract(read_bytes(args.pdf))
+    content_list = client.extract(read_bytes(args.pdf), Path(args.pdf).name)
     report_extraction(content_list)
 
     chunks = chunk_content_list(content_list, args.doc_id)

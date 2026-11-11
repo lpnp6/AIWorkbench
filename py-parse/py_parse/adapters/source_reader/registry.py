@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
-from ..ports.source_reader import SourceReader, UnsupportedSchemeError
+from ...ports.source_reader import SourceReader, UnsupportedSchemeError
 
 
 class SourceReaderRegistry:

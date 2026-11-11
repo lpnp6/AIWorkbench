@@ -8,7 +8,7 @@ from __future__ import annotations
 from typing import BinaryIO
 from urllib.parse import urlparse
 
-from ..ports.source_reader import SourceReader, SourceReadError
+from ...ports.source_reader import SourceReader, SourceReadError
 
 _SCHEME = "minio"
 

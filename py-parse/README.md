@@ -13,13 +13,12 @@ service); this package owns the chunking logic and the gRPC contract.
 py_parse/
 ├── ports/                 # Interfaces (dependency inversion)
 │   ├── source_reader.py     # SourceReader: storage abstraction
-│   └── document_extractor.py  # DocumentExtractor: PDF bytes → content_list
+│   └── document_extractor.py  # DocumentExtractor: document bytes → content_list
 ├── adapters/              # Concrete implementations
-│   ├── mineru_client.py     # HTTP client over a local mineru-api service
-│   ├── file_reader.py       # file://  local filesystem
-│   ├── minio_reader.py      # minio://
-│   ├── s3_reader.py         # s3://
-│   └── registry.py          # scheme → reader routing
+│   ├── extractor/           # MinerU V1 Tasks API client
+│   ├── source_reader/       # file:// / minio:// / s3:// + scheme registry
+│   ├── db/                  # SQLAlchemy models + Redis/Postgres task store
+│   └── queue/               # Celery app, worker task, TaskQueue adapter
 ├── domain/                # Core parsing logic (depends only on ports)
 │   ├── models.py            # Chunk / ChunkMetadata / DocMeta / ParseOutput
 │   ├── chunker.py           # content_list → chunks (heading grouping + packing)
@@ -33,20 +32,20 @@ proto/
 
 py-parser does **not** bundle MinerU; it talks to a MinerU HTTP service.
 
-MinerU 4.1 splits the service in two: `mineru-kit api-server` runs the GPU
-parsing engine (asynchronous Tasks API), while the synchronous
-`POST /v1/file_parse` that this client uses lives in a separate
-`mineru-kit file-parse-server` wrapper. Both are required.
+MinerU 4.1's `mineru-kit api-server` runs the GPU parsing engine and exposes
+the asynchronous **V1 Tasks API**. `MineruClient` drives it directly
+(`POST /v1/tasks` → upload → poll → download), so only one MinerU service is
+needed; the optional `file-parse-server` wrapper is not used.
 
 ### Option 1: Docker
 
 ```bash
 docker compose -f docker/compose.yaml up -d
-curl http://localhost:8000/docs     # → file-parse wrapper's OpenAPI page
+curl http://localhost:8000/v1/health   # → MinerU engine health
 ```
 
-`docker/compose.mineru.yaml` starts just the two MinerU services (engine +
-wrapper) without the gRPC server.
+`docker/compose.mineru.yaml` starts just the MinerU engine without the gRPC
+server.
 
 ### Option 2: pip (bare metal)
 
@@ -59,17 +58,13 @@ pip install -r requirements-mineru.txt
 # 2. Confirm GPU is used (False = torch was installed as CPU build)
 python -c "import torch; print(torch.cuda.is_available())"
 
-# 3. Download models, then start the engine and the sync wrapper
+# 3. Download models, then start the engine
 export MINERU_MODEL_SOURCE=modelscope
 mineru-kit models download --tier standard --small-backend torch --vlm-engine vllm
 mineru-kit api-server --host 127.0.0.1 --port 8000
-
-# in a second terminal, same env: the endpoint the client actually calls
-mineru-kit file-parse-server --api-url http://127.0.0.1:8000 --host 0.0.0.0 --port 8003
 ```
 
-Point `MINERU_URL` / `MineruClient(base_url=...)` at the wrapper (port 8003
-above; Docker publishes it on 8000).
+Point `MINERU_URL` / `MineruClient(base_url=...)` at the engine (port 8000).
 
 ### What the client does with MinerU's output
 
@@ -121,7 +116,7 @@ Run the gRPC server directly (no Docker) with `python -m py_parse`, and a
 worker with:
 
 ```bash
-celery -A py_parse.adapters.celery_app worker --loglevel=info -c 2
+celery -A py_parse.adapters.queue.celery_app worker --loglevel=info -c 2
 ```
 
 See `py_parse/config.py` for env vars (`GRPC_PORT`, `REDIS_URL`, `POSTGRES_DSN`,
@@ -165,5 +160,5 @@ registry.register("file", FileSourceReader())
 # ...
 
 stream = registry.resolve("file:///data/docs/doc_001.pdf").read(...)
-out = parser.parse(stream, doc_id="doc_001")
+out = parser.parse(stream, doc_id="doc_001", filename="doc_001.pdf")
 ```

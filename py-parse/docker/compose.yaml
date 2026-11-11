@@ -1,190 +1,34 @@
-# 全栈本地部署：MinerU 4.x 解析服务 + py-parse 异步解析栈
+# Regular/dev environment: the full production stack plus a read-only mount of
+# the host book directory.
 #
-# MinerU 4.1 拆成两个服务：
-#   - mineru-api          : GPU 解析引擎（异步 Tasks API，端口 8000，内部）
-#   - mineru-file-parse   : 同步 /v1/file_parse 包装层（MineruClient 调它，对外 8000→8003）
+# The only difference from compose.prod.yaml is that celery-worker gets the book
+# directory mounted, so workers read file:// sources directly from their own
+# filesystem and the benchmark script does not need to docker-cp them (run it
+# with --stage none).
 #
-# py-parse 异步栈：
-#   - redis               : Celery broker + 任务状态热缓存
-#   - postgres            : 任务结果持久化（tasks + chunks）
-#   - celery-worker       : 消费队列，跑 read→extract→chunk 重活
-#   - py-parse            : gRPC 控制面（SubmitParse / GetResult），端口 50051
+#   Start:     docker compose -f docker/compose.yaml up -d --build
+#   One GPU:   keep a single MinerU engine and let both workers share it:
+#                MINERU_REPLICAS=1 WORKER_REPLICAS=2 CELERY_WORKER_CONCURRENCY=4 \
+#                  docker compose -f docker/compose.yaml up -d
+#   Benchmark: python scripts/benchmark_parse.py --root D:/MMLongBench-Doc/documents
+#              (the script detects this mount and skips staging)
 #
-# 前提：
-#   - Linux 或 Windows WSL2（Docker 版 MinerU 不支持 macOS GPU 加速）
-#   - NVIDIA GPU（Volta+，建议 8GB+ 显存）+ 可用的 GPU 透传
-#     （验证：docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi）
-#   - MinerU 官方不再发布预构建镜像，mineru-api 由本目录的 Dockerfile.mineru 构建，
-#     模型权重在构建时下载并打进镜像（镜像很大，首次构建耗时较久）
-#
-# 启动：  docker compose -f docker/compose.yaml up -d --build
-# 健康：  curl http://localhost:8000/docs     （file-parse 包装层）
-# 文档：  https://opendatalab.github.io/MinerU/usage/file_parse
+# Override the host directory with BOOKS_DIR (default D:/MMLongBench-Doc/documents).
+# For production use compose.prod.yaml: it mounts no host directory and does not
+# depend on a book library path. Service docs (MinerU, scaling, health checks)
+# live in compose.prod.yaml.
 
 name: py-parse
 
-x-parse-env: &parse-env
-  MINERU_URL: http://mineru-file-parse:8003   # file-parse 包装层（同步 /v1/file_parse）
-  REDIS_URL: redis://redis:6379/0
-  POSTGRES_DSN: postgresql+psycopg://postgres:postgres@postgres:5432/pyparse
-  RESULT_TTL_SECONDS: "3600"
-  # 可选：启用 minio/s3 存储后端时取消注释并填入连接配置
-  # MINIO_ENDPOINT: minio:9000
-  # MINIO_ACCESS_KEY: ...
-  # MINIO_SECRET_KEY: ...
-  # S3_ENDPOINT_URL: http://minio:9000
-  # S3_REGION: us-east-1
-  # S3_ACCESS_KEY: ...
-  # S3_SECRET_KEY: ...
+include:
+  - path: compose.prod.yaml
 
 services:
-  mineru-api:
-    build:
-      context: .
-      dockerfile: Dockerfile.mineru
-    image: mineru:4
-    container_name: mineru-api
-    restart: always
-    environment:
-      # 权重已打进镜像，运行期不再联网下载
-      MINERU_MODEL_SOURCE: local
-      TZ: Asia/Shanghai
-    entrypoint: ["mineru-kit"]
-    command:
-      - api-server
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8000"
-    ulimits:
-      memlock: -1
-      stack: 67108864
-    ipc: host
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8000/v1/health || exit 1"]
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-
-  # 同步单文件解析包装层：对外暴露 /v1/file_parse（MineruClient 调的就是它）
-  mineru-file-parse:
-    image: mineru:4
-    container_name: mineru-file-parse
-    restart: always
-    ports:
-      - "8000:8003"
-    depends_on:
-      mineru-api:
-        condition: service_healthy
-    environment:
-      TZ: Asia/Shanghai
-    entrypoint: ["mineru-kit"]
-    command:
-      - file-parse-server
-      - --api-url
-      - http://mineru-api:8000
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8003"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8003/docs || exit 1"]
-    volumes:
-      - mineru-file-parse-state:/root/.mineru
-
-  redis:
-    image: redis:7-alpine
-    container_name: py-parse-redis
-    restart: always
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis-data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  postgres:
-    image: postgres:16-alpine
-    container_name: py-parse-postgres
-    restart: always
-    ports:
-      - "5432:5432"
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: pyparse
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  # 异步解析 worker：消费 Redis 队列，跑 read→extract→chunk，写 Postgres + Redis
   celery-worker:
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    container_name: py-parse-worker
-    restart: always
-    depends_on:
-      redis:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-      mineru-file-parse:
-        condition: service_healthy
-    environment:
-      <<: *parse-env
-      CELERY_WORKER_CONCURRENCY: "${CELERY_WORKER_CONCURRENCY:-2}"
-    command: celery -A py_parse.adapters.celery_app worker --loglevel=info --concurrency=${CELERY_WORKER_CONCURRENCY:-2}
-
-  # gRPC 控制面：对外暴露 SubmitParse / GetResult
-  py-parse:
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    container_name: py-parse
-    restart: always
-    depends_on:
-      redis:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-    ports:
-      - "50051:50051"
-    environment:
-      <<: *parse-env
-      GRPC_HOST: 0.0.0.0
-      GRPC_PORT: "50051"
-    healthcheck:
-      # 用标准 gRPC health 服务探测（grpcio-health-checking 已在镜像内）
-      test:
-        - CMD
-        - python
-        - -c
-        - |
-          import grpc
-          from grpc_health.v1 import health_pb2, health_pb2_grpc
-          ch = grpc.insecure_channel('localhost:50051')
-          r = health_pb2_grpc.HealthStub(ch).Check(
-              health_pb2.HealthCheckRequest(), timeout=5)
-          assert r.status == health_pb2.HealthCheckResponse.SERVING
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 10s
-
-volumes:
-  # file-parse 的恢复状态（request_id → task_id），重启后仍可查询
-  mineru-file-parse-state:
-  redis-data:
-  pgdata:
+    volumes:
+      # Every replica shares the same read-only mount, so whichever worker picks
+      # up a task can read the source file.
+      - type: bind
+        source: ${BOOKS_DIR:-D:/MMLongBench-Doc/documents}
+        target: /data/books
+        read_only: true
