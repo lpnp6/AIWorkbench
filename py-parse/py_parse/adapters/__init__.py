@@ -12,7 +12,6 @@ Connection config is injected at construction time, never in the request.
 
 from .db import RedisPostgresTaskStore
 from .extractor import MineruClient
-from .queue import CeleryTaskQueue
 from .source_reader import (
     FileSourceReader,
     MinioSourceReader,
@@ -21,7 +20,6 @@ from .source_reader import (
 )
 
 __all__ = [
-    "CeleryTaskQueue",
     "FileSourceReader",
     "MineruClient",
     "MinioSourceReader",

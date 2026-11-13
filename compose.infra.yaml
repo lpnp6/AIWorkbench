@@ -2,7 +2,8 @@
 #
 # Lives in its own compose project so microservice stacks can be brought up,
 # torn down and rebuilt without touching durable state. Microservices join the
-# external `AIWorkbench` network and reach Postgres by its alias `postgres`.
+# external `AIWorkbench` network and reach Postgres at `postgres:5432` and the
+# chunks cache at `cache:6379`.
 #
 # Start once, before any microservice stack:
 #   docker compose -f compose.infra.yaml up -d --wait
@@ -10,7 +11,7 @@
 # Stop (data survives in the named volume):
 #   docker compose -f compose.infra.yaml down
 
-name: parse-infra
+name: aiworkbench-infra
 
 networks:
   AIWorkbench:
@@ -20,7 +21,7 @@ networks:
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: parse-postgres   # stable DNS name across compose projects
+    container_name: aiworkbench-postgres   # fixed name shared by every service
     restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
@@ -43,7 +44,34 @@ services:
       retries: 5
       start_period: 10s
 
+  # Redis in front of Postgres: caches parsed chunks only. Losing this data is
+  # harmless (the cache is refilled on demand), so it is not a source of truth.
+  # The service is named `cache` (not `redis`) because the py-parse stack has
+  # its own Celery `redis` service on the same AIWorkbench network; duplicate
+  # DNS aliases would make broker traffic nondeterministic.
+  cache:
+    image: redis:7-alpine
+    container_name: aiworkbench-redis
+    restart: unless-stopped
+    ports:
+      # Host-side tools only; containers use cache:6379 on AIWorkbench.
+      - "127.0.0.1:6380:6379"
+    volumes:
+      - redisdata:/data
+    networks:
+      AIWorkbench:
+        aliases:
+          - cache
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
 volumes:
-  # Fixed name: recreating/renaming the compose project never orphans the data.
+  # Fixed names: recreating/renaming the compose project never orphans the data.
   pgdata:
-    name: parse-pgdata
+    name: aiworkbench-pgdata
+  redisdata:
+    name: aiworkbench-redisdata

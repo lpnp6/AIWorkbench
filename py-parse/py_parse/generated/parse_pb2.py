@@ -22,33 +22,44 @@ _runtime_version.ValidateProtobufRuntimeVersion(
 _sym_db = _symbol_database.Default()
 
 
+from google.protobuf import timestamp_pb2 as google_dot_protobuf_dot_timestamp__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0bparse.proto\x12\x08parse.v1\".\n\x0cParseRequest\x12\x0e\n\x06\x64oc_id\x18\x01 \x01(\t\x12\x0e\n\x06source\x18\x02 \x01(\t\"&\n\x13SubmitParseResponse\x12\x0f\n\x07task_id\x18\x01 \x01(\t\"#\n\x10GetResultRequest\x12\x0f\n\x07task_id\x18\x01 \x01(\t\"\xa6\x01\n\x11GetResultResponse\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12$\n\x06status\x18\x02 \x01(\x0e\x32\x14.parse.v1.TaskStatus\x12\r\n\x05\x65rror\x18\x03 \x01(\t\x12%\n\x06result\x18\x04 \x01(\x0b\x32\x15.parse.v1.ParseResult\x12$\n\x06\x63hunks\x18\x05 \x03(\x0b\x32\x14.parse.v1.ParseChunk\"W\n\nParseChunk\x12\x10\n\x08\x63hunk_id\x18\x01 \x01(\t\x12\x0c\n\x04text\x18\x02 \x01(\t\x12)\n\x08metadata\x18\x03 \x01(\x0b\x32\x17.parse.v1.ChunkMetadata\"B\n\rChunkMetadata\x12\x0c\n\x04page\x18\x01 \x01(\x05\x12\x0f\n\x07heading\x18\x02 \x01(\t\x12\x12\n\nchunk_type\x18\x03 \x01(\t\"G\n\x0bParseResult\x12\x13\n\x0b\x63hunk_count\x18\x01 \x01(\x05\x12#\n\x08\x64oc_meta\x18\x02 \x01(\x0b\x32\x11.parse.v1.DocMeta\">\n\x07\x44ocMeta\x12\x13\n\x0btotal_pages\x18\x01 \x01(\x05\x12\r\n\x05title\x18\x02 \x01(\t\x12\x0f\n\x07warning\x18\x03 \x01(\t*\x8c\x01\n\nTaskStatus\x12\x1b\n\x17TASK_STATUS_UNSPECIFIED\x10\x00\x12\x17\n\x13TASK_STATUS_PENDING\x10\x01\x12\x17\n\x13TASK_STATUS_RUNNING\x10\x02\x12\x17\n\x13TASK_STATUS_SUCCESS\x10\x03\x12\x16\n\x12TASK_STATUS_FAILED\x10\x04\x32\x9a\x01\n\x0cParseService\x12\x44\n\x0bSubmitParse\x12\x16.parse.v1.ParseRequest\x1a\x1d.parse.v1.SubmitParseResponse\x12\x44\n\tGetResult\x12\x1a.parse.v1.GetResultRequest\x1a\x1b.parse.v1.GetResultResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0bparse.proto\x12\x08parse.v1\x1a\x1fgoogle/protobuf/timestamp.proto\".\n\x0cParseRequest\x12\x0e\n\x06\x64oc_id\x18\x01 \x01(\t\x12\x0e\n\x06source\x18\x02 \x01(\t\"&\n\x13SubmitParseResponse\x12\x0f\n\x07task_id\x18\x01 \x01(\t\"#\n\x10GetResultRequest\x12\x0f\n\x07task_id\x18\x01 \x01(\t\"\xa6\x01\n\x11GetResultResponse\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12$\n\x06status\x18\x02 \x01(\x0e\x32\x14.parse.v1.TaskStatus\x12\r\n\x05\x65rror\x18\x03 \x01(\t\x12%\n\x06result\x18\x04 \x01(\x0b\x32\x15.parse.v1.ParseResult\x12$\n\x06\x63hunks\x18\x05 \x03(\x0b\x32\x14.parse.v1.ParseChunk\"W\n\nParseChunk\x12\x10\n\x08\x63hunk_id\x18\x01 \x01(\t\x12\x0c\n\x04text\x18\x02 \x01(\t\x12)\n\x08metadata\x18\x03 \x01(\x0b\x32\x17.parse.v1.ChunkMetadata\"B\n\rChunkMetadata\x12\x0c\n\x04page\x18\x01 \x01(\x05\x12\x0f\n\x07heading\x18\x02 \x01(\t\x12\x12\n\nchunk_type\x18\x03 \x01(\t\"G\n\x0bParseResult\x12\x13\n\x0b\x63hunk_count\x18\x01 \x01(\x05\x12#\n\x08\x64oc_meta\x18\x02 \x01(\x0b\x32\x11.parse.v1.DocMeta\">\n\x07\x44ocMeta\x12\x13\n\x0btotal_pages\x18\x01 \x01(\x05\x12\r\n\x05title\x18\x02 \x01(\t\x12\x0f\n\x07warning\x18\x03 \x01(\t\"&\n\x13RequeueParseRequest\x12\x0f\n\x07task_id\x18\x01 \x01(\t\">\n\x14RequeueParseResponse\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x15\n\rrequeued_from\x18\x02 \x01(\t\"#\n\x10ListTasksRequest\x12\x0f\n\x07sources\x18\x01 \x03(\t\"9\n\x11ListTasksResponse\x12$\n\x05tasks\x18\x01 \x03(\x0b\x32\x15.parse.v1.TaskSummary\"\xd3\x01\n\x0bTaskSummary\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x0e\n\x06\x64oc_id\x18\x02 \x01(\t\x12\x0e\n\x06source\x18\x03 \x01(\t\x12$\n\x06status\x18\x04 \x01(\x0e\x32\x14.parse.v1.TaskStatus\x12\r\n\x05\x65rror\x18\x05 \x01(\t\x12.\n\ncreated_at\x18\x06 \x01(\x0b\x32\x1a.google.protobuf.Timestamp\x12.\n\nupdated_at\x18\x07 \x01(\x0b\x32\x1a.google.protobuf.Timestamp*\x8c\x01\n\nTaskStatus\x12\x1b\n\x17TASK_STATUS_UNSPECIFIED\x10\x00\x12\x17\n\x13TASK_STATUS_PENDING\x10\x01\x12\x17\n\x13TASK_STATUS_RUNNING\x10\x02\x12\x17\n\x13TASK_STATUS_SUCCESS\x10\x03\x12\x16\n\x12TASK_STATUS_FAILED\x10\x04\x32\xaf\x02\n\x0cParseService\x12\x44\n\x0bSubmitParse\x12\x16.parse.v1.ParseRequest\x1a\x1d.parse.v1.SubmitParseResponse\x12\x44\n\tGetResult\x12\x1a.parse.v1.GetResultRequest\x1a\x1b.parse.v1.GetResultResponse\x12M\n\x0cRequeueParse\x12\x1d.parse.v1.RequeueParseRequest\x1a\x1e.parse.v1.RequeueParseResponse\x12\x44\n\tListTasks\x12\x1a.parse.v1.ListTasksRequest\x1a\x1b.parse.v1.ListTasksResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'parse_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_TASKSTATUS']._serialized_start=614
-  _globals['_TASKSTATUS']._serialized_end=754
-  _globals['_PARSEREQUEST']._serialized_start=25
-  _globals['_PARSEREQUEST']._serialized_end=71
-  _globals['_SUBMITPARSERESPONSE']._serialized_start=73
-  _globals['_SUBMITPARSERESPONSE']._serialized_end=111
-  _globals['_GETRESULTREQUEST']._serialized_start=113
-  _globals['_GETRESULTREQUEST']._serialized_end=148
-  _globals['_GETRESULTRESPONSE']._serialized_start=151
-  _globals['_GETRESULTRESPONSE']._serialized_end=317
-  _globals['_PARSECHUNK']._serialized_start=319
-  _globals['_PARSECHUNK']._serialized_end=406
-  _globals['_CHUNKMETADATA']._serialized_start=408
-  _globals['_CHUNKMETADATA']._serialized_end=474
-  _globals['_PARSERESULT']._serialized_start=476
-  _globals['_PARSERESULT']._serialized_end=547
-  _globals['_DOCMETA']._serialized_start=549
-  _globals['_DOCMETA']._serialized_end=611
-  _globals['_PARSESERVICE']._serialized_start=757
-  _globals['_PARSESERVICE']._serialized_end=911
+  _globals['_TASKSTATUS']._serialized_start=1061
+  _globals['_TASKSTATUS']._serialized_end=1201
+  _globals['_PARSEREQUEST']._serialized_start=58
+  _globals['_PARSEREQUEST']._serialized_end=104
+  _globals['_SUBMITPARSERESPONSE']._serialized_start=106
+  _globals['_SUBMITPARSERESPONSE']._serialized_end=144
+  _globals['_GETRESULTREQUEST']._serialized_start=146
+  _globals['_GETRESULTREQUEST']._serialized_end=181
+  _globals['_GETRESULTRESPONSE']._serialized_start=184
+  _globals['_GETRESULTRESPONSE']._serialized_end=350
+  _globals['_PARSECHUNK']._serialized_start=352
+  _globals['_PARSECHUNK']._serialized_end=439
+  _globals['_CHUNKMETADATA']._serialized_start=441
+  _globals['_CHUNKMETADATA']._serialized_end=507
+  _globals['_PARSERESULT']._serialized_start=509
+  _globals['_PARSERESULT']._serialized_end=580
+  _globals['_DOCMETA']._serialized_start=582
+  _globals['_DOCMETA']._serialized_end=644
+  _globals['_REQUEUEPARSEREQUEST']._serialized_start=646
+  _globals['_REQUEUEPARSEREQUEST']._serialized_end=684
+  _globals['_REQUEUEPARSERESPONSE']._serialized_start=686
+  _globals['_REQUEUEPARSERESPONSE']._serialized_end=748
+  _globals['_LISTTASKSREQUEST']._serialized_start=750
+  _globals['_LISTTASKSREQUEST']._serialized_end=785
+  _globals['_LISTTASKSRESPONSE']._serialized_start=787
+  _globals['_LISTTASKSRESPONSE']._serialized_end=844
+  _globals['_TASKSUMMARY']._serialized_start=847
+  _globals['_TASKSUMMARY']._serialized_end=1058
+  _globals['_PARSESERVICE']._serialized_start=1204
+  _globals['_PARSESERVICE']._serialized_end=1507
 # @@protoc_insertion_point(module_scope)

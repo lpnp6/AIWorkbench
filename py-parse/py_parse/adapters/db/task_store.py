@@ -1,245 +1,406 @@
-"""Redis + PostgreSQL `TaskStore` implementation.
+"""PostgreSQL outbox store + Redis chunks cache.
 
-Redis is the hot status cache (the polling entry point, TTL'd); PostgreSQL is
-the durable source of truth for final results. The write ordering is deliberate:
+PostgreSQL owns task status, doc metadata and chunks. Redis caches only the
+chunks of successful tasks — status polls always hit the database, so losing or
+evicting the cache costs one extra query, never correctness.
 
-    durable (PostgreSQL) first  →  hot cache (Redis) second
+Write ordering for a result is deliberate:
 
-so a `status=success` in Redis can never precede the durable result — if the
-Redis keys expire (TTL), polling falls back to PostgreSQL.
+    Postgres commit (task SUCCESS + chunks)  →  Redis cache  →  Celery SUCCESS
+
+so a cached result can never exist without the durable row behind it.
 """
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
-from datetime import datetime, timezone
+import logging
+import uuid
 
 import redis as redis_lib
-from sqlalchemy import func, update
-from sqlalchemy.orm import Session
+from sqlalchemy import func, or_, select, update
 
 from ...domain.models import Chunk, ChunkMetadata, DocMeta
-from ...ports.task_store import TaskSnapshot, TaskStatus, TaskStore
-from .models import ChunkRow, TaskRow
+from ...ports.task_store import (
+    CreateTaskResult,
+    DispatchRecord,
+    RequeueResult,
+    TaskSnapshot,
+    TaskStatus,
+    TaskStore,
+    TaskSummary,
+)
+from .models import ChunkRow, OutboxTaskRow
 
-_TASK_KEY = "pyparse:task:{task_id}"
-_RESULT_KEY = "pyparse:result:{task_id}"
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _chunk_to_dict(c: Chunk) -> dict:
-    return {
-        "chunk_id": c.chunk_id,
-        "text": c.text,
-        "page": c.metadata.page,
-        "heading": c.metadata.heading,
-        "chunk_type": c.metadata.chunk_type,
-    }
-
-
-def _chunk_from_dict(d: dict) -> Chunk:
-    return Chunk(
-        chunk_id=d["chunk_id"],
-        text=d["text"],
-        metadata=ChunkMetadata(
-            page=int(d.get("page", 0)),
-            heading=d.get("heading", ""),
-            chunk_type=d.get("chunk_type", "text"),
-        ),
-    )
-
-
-def _doc_meta_to_dict(m: DocMeta) -> dict:
-    return {"total_pages": m.total_pages, "title": m.title, "warning": m.warning}
-
-
-def _doc_meta_from_dict(d: dict) -> DocMeta:
-    return DocMeta(
-        total_pages=int(d.get("total_pages", 0)),
-        title=d.get("title", ""),
-        warning=d.get("warning", ""),
-    )
+_LOG = logging.getLogger("py_parse.task_store")
+_CHUNKS_KEY = "pyparse:chunks:{task_id}"
 
 
 class RedisPostgresTaskStore(TaskStore):
-    """Bridges a Redis hot cache and a PostgreSQL durable store."""
+    """Postgres-backed outbox task store with a Redis cache for chunks."""
 
     def __init__(self, redis_client: redis_lib.Redis, session_factory, ttl_seconds: int) -> None:
         self._redis = redis_client
         self._sessions = session_factory
         self._ttl = ttl_seconds
 
-    # ---- writes (durable first, then hot cache) ----
+    # ---- outbox ----
 
-    def create_pending(self, task_id: str, doc_id: str, source: str) -> None:
-        now = _now()
-        # Durable row first so the fallback always has the task.
+    def create_task(self, task_id: str, doc_id: str, source: str) -> CreateTaskResult:
         with self._sessions() as s:
+            # A transaction-scoped advisory lock on the source serializes the
+            # check and the insert. SELECT ... FOR UPDATE cannot do this job:
+            # when no row exists yet there is nothing to lock, and two
+            # concurrent submitters would both pass the check. The lock is
+            # released when this transaction ends; a hash collision (two
+            # different sources sharing a lock) only costs serialization.
+            s.execute(
+                select(func.pg_advisory_xact_lock(func.hashtextextended(source, 0)))
+            )
+            existing = s.execute(
+                select(OutboxTaskRow.task_id)
+                .where(OutboxTaskRow.source == source)
+                .limit(1)
+            ).scalar_one_or_none()
+            if existing is not None:
+                return CreateTaskResult(created=False, task_id=existing)
             s.add(
-                TaskRow(
-                    task_id=task_id, doc_id=doc_id, source=source,
-                    status=TaskStatus.PENDING.value, error=None,
+                OutboxTaskRow(
+                    task_id=task_id,
+                    doc_id=doc_id,
+                    source=source,
+                    status=TaskStatus.PENDING.value,
+                    error=None,
                 )
             )
             s.commit()
-        self._redis.hset(
-            _TASK_KEY.format(task_id=task_id),
-            mapping={
-                "status": TaskStatus.PENDING.value,
-                "doc_id": doc_id,
-                "source": source,
-                "error": "",
-                "created_at": now,
-                "updated_at": now,
-            },
+        return CreateTaskResult(created=True, task_id=task_id)
+
+    def recreate_task(
+        self, task_id: str, doc_id: str, source: str, requeued_from: str
+    ) -> None:
+        # No source check by design: this is the retry path, where a second
+        # task for the same source is exactly what is wanted.
+        with self._sessions() as s:
+            s.add(
+                OutboxTaskRow(
+                    task_id=task_id,
+                    doc_id=doc_id,
+                    source=source,
+                    status=TaskStatus.PENDING.value,
+                    error=None,
+                    requeued_from=requeued_from,
+                )
+            )
+            s.commit()
+
+    def fetch_undispatched(
+        self, limit: int, stale_seconds: int
+    ) -> list[DispatchRecord]:
+        # Single statement: the subquery locks the selected rows, the UPDATE
+        # stamps them. A second dispatcher skips locked rows and the worker's
+        # claim makes a stale re-publish harmless.
+        stale_before = func.now() - func.make_interval(0, 0, 0, 0, 0, 0, stale_seconds)
+        selected = (
+            select(OutboxTaskRow.task_id)
+            .where(
+                OutboxTaskRow.status == TaskStatus.PENDING.value,
+                or_(
+                    OutboxTaskRow.dispatched_at.is_(None),
+                    OutboxTaskRow.dispatched_at < stale_before,
+                ),
+            )
+            .order_by(OutboxTaskRow.created_at)
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+            .scalar_subquery()
         )
-        self._redis.expire(_TASK_KEY.format(task_id=task_id), self._ttl)
+        with self._sessions() as s:
+            rows = s.execute(
+                update(OutboxTaskRow)
+                .where(OutboxTaskRow.task_id.in_(selected))
+                .values(dispatched_at=func.now())
+                .returning(
+                    OutboxTaskRow.task_id, OutboxTaskRow.doc_id, OutboxTaskRow.source
+                )
+            ).all()
+            s.commit()
+        return [
+            DispatchRecord(task_id=row.task_id, doc_id=row.doc_id, source=row.source)
+            for row in rows
+        ]
+
+    def release_dispatch(self, task_id: str) -> None:
+        with self._sessions() as s:
+            s.execute(
+                update(OutboxTaskRow)
+                .where(
+                    OutboxTaskRow.task_id == task_id,
+                    OutboxTaskRow.status == TaskStatus.PENDING.value,
+                )
+                .values(dispatched_at=None)
+            )
+            s.commit()
+
+    # ---- worker-side transitions ----
 
     def try_claim(self, task_id: str) -> bool:
         # Single guarded UPDATE: PostgreSQL row locking serializes concurrent
-        # deliveries, so exactly one caller observes rowcount == 1. RUNNING is
-        # persisted here rather than only cached, which also keeps the durable
-        # store truthful when Redis keys expire mid-task.
+        # queue messages, so exactly one caller observes rowcount == 1. claimed_at
+        # starts the lease that fail_stale_running() measures.
         with self._sessions() as s:
             result = s.execute(
-                update(TaskRow)
+                update(OutboxTaskRow)
                 .where(
-                    TaskRow.task_id == task_id,
-                    TaskRow.status == TaskStatus.PENDING.value,
+                    OutboxTaskRow.task_id == task_id,
+                    OutboxTaskRow.status == TaskStatus.PENDING.value,
                 )
-                .values(status=TaskStatus.RUNNING.value, updated_at=func.now())
+                .values(
+                    status=TaskStatus.RUNNING.value,
+                    claimed_at=func.now(),
+                    updated_at=func.now(),
+                )
             )
             claimed = result.rowcount == 1
             s.commit()
-        if not claimed:
-            return False
-        key = _TASK_KEY.format(task_id=task_id)
-        self._redis.hset(
-            key,
-            mapping={"status": TaskStatus.RUNNING.value, "updated_at": _now()},
+        return claimed
+
+    def fail_stale_running(self, timeout_seconds: int) -> int:
+        # One statement, so the reaper is safe with several dispatchers: the
+        # status guard means only the first one to see an expired lease wins.
+        # A NULL claimed_at is a row claimed before this column existed, i.e.
+        # certainly older than any lease.
+        claimed_before = func.now() - func.make_interval(
+            0, 0, 0, 0, 0, 0, timeout_seconds
         )
-        # The hash may have expired while the task waited in the queue; refresh
-        # the TTL so a re-created key cannot become immortal.
-        self._redis.expire(key, self._ttl)
-        return True
+        with self._sessions() as s:
+            result = s.execute(
+                update(OutboxTaskRow)
+                .where(
+                    OutboxTaskRow.status == TaskStatus.RUNNING.value,
+                    or_(
+                        OutboxTaskRow.claimed_at.is_(None),
+                        OutboxTaskRow.claimed_at < claimed_before,
+                    ),
+                )
+                .values(
+                    status=TaskStatus.FAILED.value,
+                    error=(
+                        f"abandoned: no terminal write within {timeout_seconds}s "
+                        "of the claim"
+                    ),
+                    updated_at=func.now(),
+                )
+            )
+            s.commit()
+        return result.rowcount
+
+    def list_tasks(self, sources: list[str] | None = None) -> list[TaskSummary]:
+        # DISTINCT ON keeps the newest row per source, whatever its status: a
+        # source may have several rows (each retry adds one and leaves the old
+        # one), and reporting all of them would list the same document
+        # repeatedly. The inner ORDER BY must lead with the DISTINCT ON
+        # expression; the outer one restores the "newest first" order the
+        # caller sees.
+        latest = (
+            select(
+                OutboxTaskRow.task_id,
+                OutboxTaskRow.doc_id,
+                OutboxTaskRow.source,
+                OutboxTaskRow.status,
+                OutboxTaskRow.error,
+                OutboxTaskRow.created_at,
+                OutboxTaskRow.updated_at,
+            )
+            .distinct(OutboxTaskRow.source)
+            .order_by(OutboxTaskRow.source, OutboxTaskRow.updated_at.desc())
+        )
+        if sources:
+            latest = latest.where(OutboxTaskRow.source.in_(sources))
+        latest = latest.subquery()
+        with self._sessions() as s:
+            rows = s.execute(
+                select(latest).order_by(latest.c.updated_at.desc())
+            ).all()
+        return [
+            TaskSummary(
+                task_id=r.task_id,
+                doc_id=r.doc_id,
+                source=r.source,
+                status=TaskStatus(r.status),
+                error=r.error or "",
+                created_at=r.created_at,
+                updated_at=r.updated_at,
+            )
+            for r in rows
+        ]
+
+    def requeue_failed(self, task_id: str) -> RequeueResult:
+        # FOR UPDATE serializes concurrent requeues of the same task, so a
+        # double-click produces one new row, not two. The source row is only
+        # read: its status and error stay as the record of what happened. The
+        # new row starts clean (no dispatched_at, no error) and
+        # the dispatcher picks it up on its next pass.
+        with self._sessions() as s:
+            row = s.execute(
+                select(OutboxTaskRow)
+                .where(OutboxTaskRow.task_id == task_id)
+                .with_for_update()
+            ).scalar_one_or_none()
+            if row is None:
+                return RequeueResult(source_task_id=task_id, found=False)
+            status = TaskStatus(row.status)
+            if status is not TaskStatus.FAILED:
+                return RequeueResult(
+                    source_task_id=task_id, found=True, status=status
+                )
+            doc_id, source = row.doc_id, row.source
+        new_task_id = uuid.uuid4().hex
+        self.recreate_task(new_task_id, doc_id, source, requeued_from=task_id)
+        return RequeueResult(
+            source_task_id=task_id,
+            found=True,
+            status=status,
+            new_task_id=new_task_id,
+        )
 
     def set_failed(self, task_id: str, error: str) -> None:
         with self._sessions() as s:
-            task = s.get(TaskRow, task_id)
-            if task is not None:
-                task.status = TaskStatus.FAILED.value
-                task.error = error
+            row = s.get(OutboxTaskRow, task_id)
+            if row is not None:
+                row.status = TaskStatus.FAILED.value
+                row.error = error
                 s.commit()
-        key = _TASK_KEY.format(task_id=task_id)
-        self._redis.hset(
-            key,
-            mapping={
-                "status": TaskStatus.FAILED.value,
-                "error": error,
-                "updated_at": _now(),
-            },
-        )
-        self._redis.expire(key, self._ttl)
 
     def save_result(
         self, task_id: str, doc_id: str, source: str, doc_meta: DocMeta, chunks: list[Chunk]
     ) -> None:
-        # 1. Durable store: upsert task + replace chunks, then commit.
+        chunk_dicts = [
+            {
+                "chunk_id": c.chunk_id,
+                "text": c.text,
+                "page": c.metadata.page,
+                "heading": c.metadata.heading,
+                "chunk_type": c.metadata.chunk_type,
+            }
+            for c in chunks
+        ]
         with self._sessions() as s:
-            task = s.get(TaskRow, task_id)
-            if task is None:
-                task = TaskRow(
-                    task_id=task_id, doc_id=doc_id, source=source,
-                    status=TaskStatus.SUCCESS.value, error=None,
+            row = s.get(OutboxTaskRow, task_id)
+            if row is None:
+                row = OutboxTaskRow(
+                    task_id=task_id,
+                    doc_id=doc_id,
+                    source=source,
+                    status=TaskStatus.SUCCESS.value,
+                    error=None,
                 )
-                s.add(task)
-            task.status = TaskStatus.SUCCESS.value
-            task.error = None
-            task.total_pages = doc_meta.total_pages
-            task.title = doc_meta.title
-            task.warning = doc_meta.warning
+                s.add(row)
+            row.status = TaskStatus.SUCCESS.value
+            row.error = None
+            row.total_pages = doc_meta.total_pages
+            row.title = doc_meta.title
+            row.warning = doc_meta.warning
             # Replace any prior chunks (idempotent on retry).
             s.query(ChunkRow).filter(ChunkRow.task_id == task_id).delete()
             for seq, c in enumerate(chunks):
                 s.add(
                     ChunkRow(
-                        task_id=task_id, seq=seq, chunk_id=c.chunk_id, text=c.text,
-                        page=c.metadata.page, heading=c.metadata.heading,
+                        task_id=task_id,
+                        seq=seq,
+                        chunk_id=c.chunk_id,
+                        text=c.text,
+                        page=c.metadata.page,
+                        heading=c.metadata.heading,
                         chunk_type=c.metadata.chunk_type,
                     )
                 )
             s.commit()
 
-        # 2. Hot cache: only after the durable commit succeeded.
-        result_json = json.dumps(
-            {
-                "doc_meta": _doc_meta_to_dict(doc_meta),
-                "chunks": [_chunk_to_dict(c) for c in chunks],
-            },
-            ensure_ascii=False,
-        )
-        self._redis.set(_RESULT_KEY.format(task_id=task_id), result_json, ex=self._ttl)
-        key = _TASK_KEY.format(task_id=task_id)
-        self._redis.hset(
-            key,
-            mapping={"status": TaskStatus.SUCCESS.value, "updated_at": _now()},
-        )
-        self._redis.expire(key, self._ttl)
+        # Cache only after the durable commit; a cache failure is not fatal.
+        try:
+            self._redis.set(
+                _CHUNKS_KEY.format(task_id=task_id),
+                json.dumps(chunk_dicts, ensure_ascii=False),
+                ex=self._ttl,
+            )
+        except redis_lib.RedisError:
+            _LOG.warning("chunks cache write failed for task %s", task_id, exc_info=True)
 
-    # ---- read (hot cache, then durable fallback) ----
+    # ---- read (Postgres for status, Redis for chunks) ----
 
     def get_snapshot(self, task_id: str) -> TaskSnapshot | None:
-        task_key = _TASK_KEY.format(task_id=task_id)
-        raw = self._redis.hgetall(task_key)
-        if raw:
-            status = TaskStatus(raw.get("status", TaskStatus.PENDING.value))
-            if status == TaskStatus.SUCCESS:
-                result_raw = self._redis.get(_RESULT_KEY.format(task_id=task_id))
-                if result_raw:
-                    payload = json.loads(result_raw)
-                    return TaskSnapshot(
-                        task_id=task_id,
-                        status=status,
-                        doc_meta=_doc_meta_from_dict(payload["doc_meta"]),
-                        chunks=[_chunk_from_dict(c) for c in payload["chunks"]],
-                    )
-                # status=success but result expired → fall through to DB.
-            else:
-                return TaskSnapshot(
-                    task_id=task_id,
-                    status=status,
-                    error=raw.get("error", ""),
-                )
-
-        # Redis miss (TTL expired) → durable fallback.
-        return self._snapshot_from_db(task_id)
-
-    def _snapshot_from_db(self, task_id: str) -> TaskSnapshot | None:
         with self._sessions() as s:
-            task = s.get(TaskRow, task_id)
-            if task is None:
+            row = s.get(OutboxTaskRow, task_id)
+            if row is None:
                 return None
-            status = TaskStatus(task.status)
+            status = TaskStatus(row.status)
             if status != TaskStatus.SUCCESS:
-                return TaskSnapshot(task_id=task_id, status=status, error=task.error or "")
-            chunks = [
-                _chunk_from_dict(
-                    {
-                        "chunk_id": c.chunk_id, "text": c.text, "page": c.page,
-                        "heading": c.heading, "chunk_type": c.chunk_type,
-                    }
-                )
-                for c in s.query(ChunkRow)
-                .filter(ChunkRow.task_id == task_id)
-                .order_by(ChunkRow.seq)
-                .all()
-            ]
+                return TaskSnapshot(task_id=task_id, status=status, error=row.error or "")
             doc_meta = DocMeta(
-                total_pages=task.total_pages or 0,
-                title=task.title or "",
-                warning=task.warning or "",
+                total_pages=row.total_pages or 0,
+                title=row.title or "",
+                warning=row.warning or "",
             )
-            return TaskSnapshot(task_id=task_id, status=status, doc_meta=doc_meta, chunks=chunks)
+
+        key = _CHUNKS_KEY.format(task_id=task_id)
+        try:
+            cached = self._redis.get(key)
+        except redis_lib.RedisError:
+            _LOG.warning("chunks cache read failed for task %s", task_id, exc_info=True)
+            cached = None
+
+        if cached is not None:
+            chunks = [
+                Chunk(
+                    chunk_id=d["chunk_id"],
+                    text=d["text"],
+                    metadata=ChunkMetadata(
+                        page=int(d.get("page", 0)),
+                        heading=d.get("heading", ""),
+                        chunk_type=d.get("chunk_type", "text"),
+                    ),
+                )
+                for d in json.loads(cached)
+            ]
+        else:
+            with self._sessions() as s:
+                rows = (
+                    s.query(ChunkRow)
+                    .filter(ChunkRow.task_id == task_id)
+                    .order_by(ChunkRow.seq)
+                    .all()
+                )
+                chunks = [
+                    Chunk(
+                        chunk_id=r.chunk_id,
+                        text=r.text,
+                        metadata=ChunkMetadata(
+                            page=r.page, heading=r.heading, chunk_type=r.chunk_type
+                        ),
+                    )
+                    for r in rows
+                ]
+            try:
+                self._redis.set(
+                    key,
+                    json.dumps(
+                        [
+                            {
+                                "chunk_id": c.chunk_id,
+                                "text": c.text,
+                                "page": c.metadata.page,
+                                "heading": c.metadata.heading,
+                                "chunk_type": c.metadata.chunk_type,
+                            }
+                            for c in chunks
+                        ],
+                        ensure_ascii=False,
+                    ),
+                    ex=self._ttl,
+                )
+            except redis_lib.RedisError:
+                _LOG.warning("chunks cache refill failed for task %s", task_id, exc_info=True)
+
+        return TaskSnapshot(
+            task_id=task_id, status=TaskStatus.SUCCESS, doc_meta=doc_meta, chunks=chunks
+        )

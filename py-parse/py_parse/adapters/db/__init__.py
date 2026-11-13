@@ -1,9 +1,9 @@
-"""Database adapters: SQLAlchemy models/engine and the durable task store."""
+"""Database adapters: SQLAlchemy models/engine and the outbox task store."""
 
 from .models import (
     Base,
     ChunkRow,
-    TaskRow,
+    OutboxTaskRow,
     create_engine_from_dsn,
     init_db,
     make_session_factory,
@@ -13,7 +13,7 @@ from .task_store import RedisPostgresTaskStore
 __all__ = [
     "Base",
     "ChunkRow",
-    "TaskRow",
+    "OutboxTaskRow",
     "RedisPostgresTaskStore",
     "create_engine_from_dsn",
     "init_db",

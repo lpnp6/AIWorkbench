@@ -18,6 +18,7 @@ from .parser import DocumentParser
 
 if TYPE_CHECKING:
     from ..adapters.source_reader import SourceReaderRegistry
+    from .models import ParseOutput
 
 LOG = logging.getLogger("py_parse.parse_task")
 
@@ -29,8 +30,8 @@ def run_parse_task(
     registry: "SourceReaderRegistry",
     parser: DocumentParser,
     store: TaskStore,
-) -> None:
-    """Execute one parse task end-to-end.
+) -> "ParseOutput | None":
+    """Execute one parse task end-to-end, returning the result (None if duplicate).
 
     Atomically claims the task (PENDING → RUNNING), reads the source, extracts,
     chunks, and persists the result. On a domain error it records the failure
@@ -47,20 +48,19 @@ def run_parse_task(
             "task %s already claimed or finished; skipping duplicate delivery",
             task_id,
         )
-        return
+        return None
     try:
         reader = registry.resolve(source)   # raises UnsupportedSchemeError
         stream = reader.read(source)        # raises SourceReadError
+        # The extractor picks a parser from the extension, so send a basename.
+        path = urlparse(source).path if "://" in source else source
+        filename = unquote(path.replace("\\", "/").rsplit("/", 1)[-1]).strip()
         with stream:
-            output = parser.parse(stream, doc_id=doc_id, filename=_source_filename(source))
+            output = parser.parse(
+                stream, doc_id=doc_id, filename=filename or "document.pdf"
+            )
         store.save_result(task_id, doc_id, source, output.doc_meta, output.chunks)
+        return output
     except (UnsupportedSchemeError, SourceReadError, DocumentExtractError) as e:
         store.set_failed(task_id, str(e))
         raise
-
-
-def _source_filename(source: str) -> str:
-    """Basename of the source URI; extractors use its extension to pick a parser."""
-    path = urlparse(source).path if "://" in source else source
-    name = unquote(path.replace("\\", "/").rsplit("/", 1)[-1]).strip()
-    return name or "document.pdf"

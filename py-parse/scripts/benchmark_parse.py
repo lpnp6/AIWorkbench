@@ -1,53 +1,47 @@
 #!/usr/bin/env python
 """Batch-parse a local directory through the ParseService gRPC API.
 
-One `SubmitParse` per file, poll `GetResult` until terminal, persist every
-result, and continuously log per-file timing plus host CPU/GPU usage and
-aggregate throughput.
+Before submitting anything the script asks `ListTasks` about every source it is
+about to parse, then, per file, does exactly one of:
 
-Why staging?  The Celery workers read `file://` sources from *their own*
-container filesystem, and this script must not touch docker/compose.yaml.
-So before submitting, it streams the selected files into every running
-`celery-worker` container with:
+    no task yet      SubmitParse                 (action=submitted)
+    newest SUCCESS   skip, nothing to do         (action=skipped)
+    newest FAILED    RequeueParse → new task     (action=requeued)
+    newest PENDING/RUNNING
+                     attach to that task         (action=attached)
 
-    docker exec -i <worker> tar -xf - -C <container-root>
+So re-running the same directory only parses what is missing, retries what
+failed, and joins what is still in flight — it never resubmits a source that
+already has a task (which `SubmitParse` would reject with ALREADY_EXISTS).
 
-and submits `file://<container-root>/<relative-path>` URIs.  The worker
-containers have no extra mounts; nothing in compose changes.
+Each file gets its own worker (the worker count equals the number of selected
+files); that worker owns the file's task and polls `GetResult` until it reaches
+a terminal state. The program does not return while any task is still pending
+or running — there is no global duration limit and no per-task timeout.
+
+Per task it records:
+
+    submit_s  SubmitParse/RequeueParse call latency
+    queue_s   task call response -> first observed RUNNING (time queued)
+    exec_s    first observed RUNNING -> terminal state (parse execution)
+    total_s   task call response -> terminal state
+
+RUNNING is observed by polling, so the resolution is the poll interval. A
+worker holds RUNNING for the whole parse, so the queue timing is reliable;
+tasks that finish between two polls have no observed RUNNING and get null
+queue_s/exec_s (their total_s is still recorded).
 
 Output layout (--out-dir):
 
     results/<index>_<name>.json   full chunk payload per successful file
-    files.jsonl                   one row per file: timing, CPU/GPU before/after/peak
-    throughput.jsonl              periodic throughput + resource samples
+    files.jsonl                   one row per file: timings + outcome
+    summary.json                  aggregate outcome and overall throughput
     run.log                       human-readable progress log
-    summary.json                  final aggregate (written even on Ctrl-C)
 
-Load mode (--users N) simulates N virtual users. All users go at once: each
-one submits its parse (files are handed out round-robin, so the whole corpus
-is reused), polls until it gets a result, records what it received, and exits.
-The run ends when every user has its result (or after --duration seconds as a
-safety limit, 0 = no limit).
-
-Only --max-inflight RPCs are started at the same time (default 512). That is
-not a server limit but a client one: grpc.aio cancels calls once a few thousand
-are started simultaneously (reproduced: ~7k of 10k concurrent calls come back
-CANCELLED), so without the cap the benchmark would measure gRPC's client
-queue rather than the service. The time a request spends waiting for this
-client-side slot is recorded as queue_s.
-
-Everything a user "received" is recorded per request:
-
-    requests.jsonl   user_id, file, status (success/failed/timeout/aborted),
-                     server error text, submit latency, wait latency,
-                     chunk count, pages, title, first-chunk preview
-
-Load mode skips full result persistence by default (10k users produce far too
-much data); pass --save-results to keep every payload. Note that the parses
-themselves keep running server-side after the load phase ends: the gRPC API
-has no cancel, so queued Celery tasks are drained by the workers afterwards.
-For the same reason, load mode never deletes staged files at the end of the
-run (a bind mount, as in compose.yaml, has nothing to delete).
+Why staging?  The Celery workers read `file://` sources from *their own*
+container filesystem. Unless the workers already bind-mount the corpus, the
+selected files are streamed into every running `celery-worker` container with
+`docker exec ... tar` before submission. Nothing in compose changes.
 
 Examples:
 
@@ -61,31 +55,26 @@ Examples:
     python scripts/benchmark_parse.py --root D:/MMLongBench-Doc/documents --stage none \
         --container-root /data/books
 
-    # 10k virtual users, one parse each, run until every result is in
-    python scripts/benchmark_parse.py --users 10000 \
-        --ext .pdf --ext .epub --out-dir out/load-10k
+Why threads rather than processes?  Polling is I/O-bound, and Windows cannot
+run this many worker processes from one manager anyway: ProcessPoolExecutor
+caps at 61 workers, and multiprocessing.Pool fails beyond 63 wait handles
+(`ValueError: need at most 63 handles`). Threads give every file its own
+concurrent worker without that ceiling; the GIL is released while gRPC waits.
 """
 from __future__ import annotations
 
 import argparse
-import asyncio
-import ctypes
 import hashlib
 import json
 import logging
 import math
 import os
-import random
 import re
-import shutil
 import subprocess
 import sys
 import tarfile
-import threading
 import time
-from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from fnmatch import fnmatch
 from pathlib import Path
@@ -98,26 +87,25 @@ import grpc  # noqa: E402
 
 from py_parse.generated import (  # noqa: E402
     GetResultRequest,
+    ListTasksRequest,
     ParseRequest,
     ParseServiceStub,
+    RequeueParseRequest,
     TaskStatus,
 )
 
 LOG = logging.getLogger("bench")
 
-# tasks.doc_id is varchar(256); keep a safe margin.
+# outbox_tasks.doc_id is varchar(256); keep a safe margin.
 MAX_DOC_ID_LEN = 240
 # Result payloads can be large (many chunks); the server's default client-side
 # receive limit is 4 MiB, which is easy to exceed on a book-length document.
 GRPC_MAX_MESSAGE_BYTES = 512 * 1024 * 1024
 RETRYABLE = {grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED}
+SUBMIT_ATTEMPTS = 5
 
 SYSTEM_FILES = {"thumbs.db", "desktop.ini", ".ds_store"}
 _BAD_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-_JSONL_LOCK = threading.Lock()
-# Path -> open append handle. Load mode can emit thousands of rows per second;
-# opening the file per row would dominate the benchmark itself.
-_JSONL_HANDLES: dict[str, Any] = {}
 
 
 # --------------------------------------------------------------------------- #
@@ -128,15 +116,8 @@ def utc_now() -> str:
 
 
 def append_jsonl(path: Path, row: dict[str, Any]) -> None:
-    line = json.dumps(row, ensure_ascii=False, default=str)
-    key = str(path)
-    with _JSONL_LOCK:
-        fh = _JSONL_HANDLES.get(key)
-        if fh is None:
-            fh = path.open("a", encoding="utf-8")
-            _JSONL_HANDLES[key] = fh
-        fh.write(line + "\n")
-        fh.flush()
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
 
 
 def _fmt(value: float | None, digits: int = 1) -> str:
@@ -166,8 +147,22 @@ def _percentile(sorted_values: list[float], q: float) -> float | None:
     return sorted_values[lo] * (hi - pos) + sorted_values[hi] * (pos - lo)
 
 
+def _summary_stats(values: list[float]) -> dict[str, Any]:
+    ordered = sorted(values)
+    if not ordered:
+        return {"count": 0, "mean": None, "p50": None, "p90": None, "p95": None, "max": None}
+    return {
+        "count": len(ordered),
+        "mean": round(sum(ordered) / len(ordered), 3),
+        "p50": _round(_percentile(ordered, 0.50), 3),
+        "p90": _round(_percentile(ordered, 0.90), 3),
+        "p95": _round(_percentile(ordered, 0.95), 3),
+        "max": round(ordered[-1], 3),
+    }
+
+
 def _make_doc_id(rel: str, max_len: int = MAX_DOC_ID_LEN) -> str:
-    """Fit a relative path into tasks.doc_id (varchar(256)).
+    """Fit a relative path into outbox_tasks.doc_id (varchar(256)).
 
     Short paths are used verbatim; long ones keep a hash prefix plus the tail
     (the filename is what matters when reading server logs).
@@ -177,6 +172,46 @@ def _make_doc_id(rel: str, max_len: int = MAX_DOC_ID_LEN) -> str:
     digest = hashlib.sha1(rel.encode("utf-8")).hexdigest()[:10]
     tail = rel[-(max_len - len(digest) - 1):]
     return f"{digest}:{tail}"
+
+
+def _source_uri(rel: str, container_root: str) -> str:
+    return "file://" + quote(f"{container_root}/{rel}", safe="/")
+
+
+def lookup_existing(
+    addr: str, sources: list[str], batch: int = 500
+) -> dict[str, Any]:
+    """Map source URI → that source's newest task summary.
+
+    One `ListTasks` call per batch of sources (the request carries the whole
+    list; batching only keeps a huge corpus from producing one giant message).
+    A source missing from the result has no task and must be submitted.
+    """
+    existing: dict[str, Any] = {}
+    channel = grpc.insecure_channel(
+        addr,
+        options=[("grpc.max_receive_message_length", GRPC_MAX_MESSAGE_BYTES)],
+    )
+    stub = ParseServiceStub(channel)
+    try:
+        for start in range(0, len(sources), batch):
+            chunk = sources[start : start + batch]
+            for attempt in range(SUBMIT_ATTEMPTS):
+                try:
+                    response = stub.ListTasks(
+                        ListTasksRequest(sources=chunk), timeout=60
+                    )
+                    break
+                except grpc.RpcError as exc:
+                    if exc.code() in RETRYABLE and attempt < SUBMIT_ATTEMPTS - 1:
+                        time.sleep(min(5.0, 2.0**attempt))
+                        continue
+                    raise
+            for task in response.tasks:
+                existing[task.source] = task
+    finally:
+        channel.close()
+    return existing
 
 
 def _safe_stem(rel: str) -> str:
@@ -373,759 +408,170 @@ def cleanup_staged(containers: list[str], croot: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# resource sampling: host CPU + NVIDIA GPU
-# --------------------------------------------------------------------------- #
-class _FileTime(ctypes.Structure):
-    _fields_ = [("dwLowDateTime", ctypes.c_uint32), ("dwHighDateTime", ctypes.c_uint32)]
-
-
-def _windows_times() -> tuple[int, int] | None:
-    """(idle, kernel+user) 100ns ticks, system-wide."""
-    idle, kernel, user = _FileTime(), _FileTime(), _FileTime()
-    ok = ctypes.windll.kernel32.GetSystemTimes(  # type: ignore[attr-defined]
-        ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)
-    )
-    if not ok:
-        return None
-
-    def conv(ft: _FileTime) -> int:
-        return (ft.dwHighDateTime << 32) | ft.dwLowDateTime
-
-    # Kernel time already includes idle time.
-    return conv(idle), conv(kernel) + conv(user)
-
-
-def _linux_times() -> tuple[int, int] | None:
-    try:
-        with open("/proc/stat", "r", encoding="ascii") as fh:
-            parts = fh.readline().split()
-    except OSError:
-        return None
-    if not parts or parts[0] != "cpu":
-        return None
-    values = [int(v) for v in parts[1:]]
-    idle = values[3] + (values[4] if len(values) > 4 else 0)  # idle + iowait
-    return idle, sum(values)
-
-
-class CpuMeter:
-    """System-wide CPU utilisation between consecutive samples."""
-
-    def __init__(self) -> None:
-        self._read = _windows_times if os.name == "nt" else _linux_times
-        self._last = self._read()
-
-    def percent(self) -> float | None:
-        cur = self._read()
-        if cur is None:
-            return None
-        if self._last is None:
-            self._last = cur
-            return None
-        (idle0, total0), (idle1, total1) = self._last, cur
-        self._last = cur
-        if total1 <= total0:
-            return None
-        pct = 100.0 * (1.0 - (idle1 - idle0) / (total1 - total0))
-        return max(0.0, min(100.0, pct))
-
-
-def read_gpu() -> tuple[float | None, float | None, float | None]:
-    """(mean util %, total memory used MiB, total memory MiB) across GPUs."""
-    exe = shutil.which("nvidia-smi")
-    if not exe:
-        return None, None, None
-    try:
-        out = subprocess.run(
-            [
-                exe,
-                "--query-gpu=utilization.gpu,memory.used,memory.total",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        ).stdout
-    except (OSError, subprocess.TimeoutExpired):
-        return None, None, None
-
-    utils: list[float] = []
-    used: list[float] = []
-    total: list[float] = []
-    for line in out.strip().splitlines():
-        cols = [c.strip() for c in line.split(",")]
-        if len(cols) != 3:
-            continue
-        try:
-            utils.append(float(cols[0]))
-            used.append(float(cols[1]))
-            total.append(float(cols[2]))
-        except ValueError:
-            continue  # e.g. [N/A] on some WSL/driver combinations
-    if not utils:
-        return None, None, None
-    return sum(utils) / len(utils), sum(used), sum(total)
-
-
-@dataclass(frozen=True)
-class Sample:
-    t: float
-    cpu_pct: float | None
-    gpu_util_pct: float | None
-    gpu_mem_used_mib: float | None
-    gpu_mem_total_mib: float | None
-
-
-class ResourceSampler(threading.Thread):
-    def __init__(self, interval: float) -> None:
-        super().__init__(name="resource-sampler", daemon=True)
-        self._interval = interval
-        self._samples: deque[Sample] = deque(maxlen=20_000)
-        self._lock = threading.Lock()
-        self._stop = threading.Event()
-        self._meter = CpuMeter()
-        self._peak_cpu = 0.0
-        self._peak_gpu_util = 0.0
-        self._peak_gpu_mem = 0.0
-        self._gpu_total: float | None = None
-        self._has_cpu = False
-        self._has_gpu = False
-
-    def run(self) -> None:
-        while not self._stop.is_set():
-            cpu = self._meter.percent()
-            gpu_util, gpu_used, gpu_total = read_gpu()
-            sample = Sample(time.time(), cpu, gpu_util, gpu_used, gpu_total)
-            with self._lock:
-                self._samples.append(sample)
-                if cpu is not None:
-                    self._has_cpu = True
-                    self._peak_cpu = max(self._peak_cpu, cpu)
-                if gpu_util is not None:
-                    self._has_gpu = True
-                    self._peak_gpu_util = max(self._peak_gpu_util, gpu_util)
-                if gpu_used is not None:
-                    self._peak_gpu_mem = max(self._peak_gpu_mem, gpu_used)
-                if gpu_total is not None:
-                    self._gpu_total = gpu_total
-            self._stop.wait(self._interval)
-
-    def stop(self) -> None:
-        self._stop.set()
-
-    def latest(self) -> Sample:
-        with self._lock:
-            if self._samples:
-                return self._samples[-1]
-        return Sample(time.time(), None, None, None, None)
-
-    def peak_between(self, t0: float, t1: float) -> Sample:
-        with self._lock:
-            window = [s for s in self._samples if t0 <= s.t <= t1]
-        if not window:
-            return Sample(t1, None, None, None, None)
-        return Sample(
-            t1,
-            max((s.cpu_pct for s in window if s.cpu_pct is not None), default=None),
-            max((s.gpu_util_pct for s in window if s.gpu_util_pct is not None), default=None),
-            max(
-                (s.gpu_mem_used_mib for s in window if s.gpu_mem_used_mib is not None),
-                default=None,
-            ),
-            next(
-                (
-                    s.gpu_mem_total_mib
-                    for s in reversed(window)
-                    if s.gpu_mem_total_mib is not None
-                ),
-                None,
-            ),
-        )
-
-    def overall_peaks(self) -> dict[str, float | None]:
-        with self._lock:
-            return {
-                "peak_cpu_pct": round(self._peak_cpu, 1) if self._has_cpu else None,
-                "peak_gpu_util_pct": round(self._peak_gpu_util, 1) if self._has_gpu else None,
-                "peak_gpu_mem_used_mib": (
-                    round(self._peak_gpu_mem, 1) if self._peak_gpu_mem else None
-                ),
-                "gpu_mem_total_mib": self._gpu_total,
-            }
-
-
-# --------------------------------------------------------------------------- #
-# counters + throughput reporter
-# --------------------------------------------------------------------------- #
-class Stats:
-    def __init__(self) -> None:
-        self.start = time.monotonic()
-        self._lock = threading.Lock()
-        self.submitted = 0
-        self.finished = 0
-        self.succeeded = 0
-        self.failed = 0
-        self.timed_out = 0
-        self.aborted = 0
-        self.chunks = 0
-        self.pages = 0
-        # Bounded: load mode can finish millions of requests in a long run.
-        self.durations: deque[float] = deque(maxlen=100_000)
-        self._done_at: deque[float] = deque(maxlen=100_000)
-
-    def mark_submitted(self) -> None:
-        with self._lock:
-            self.submitted += 1
-
-    def mark_finished(
-        self,
-        ok: bool,
-        duration: float,
-        *,
-        chunks: int = 0,
-        pages: int = 0,
-        timed_out: bool = False,
-        aborted: bool = False,
-    ) -> None:
-        with self._lock:
-            self.finished += 1
-            if ok:
-                self.succeeded += 1
-            elif aborted:
-                self.aborted += 1
-            elif timed_out:
-                self.timed_out += 1
-            else:
-                self.failed += 1
-            self.chunks += chunks
-            self.pages += pages
-            self.durations.append(duration)
-            self._done_at.append(time.monotonic())
-
-    def snapshot(self, window: float) -> dict[str, Any]:
-        now = time.monotonic()
-        with self._lock:
-            while self._done_at and now - self._done_at[0] > window:
-                self._done_at.popleft()
-            recent = len(self._done_at)
-            elapsed = max(now - self.start, 1e-9)
-            span = min(window, elapsed)
-            durations = self.durations
-            return {
-                "elapsed_s": elapsed,
-                "submitted": self.submitted,
-                "finished": self.finished,
-                "in_flight": self.submitted - self.finished,
-                "success": self.succeeded,
-                "failed": self.failed,
-                "timed_out": self.timed_out,
-                "aborted": self.aborted,
-                "chunks": self.chunks,
-                "pages": self.pages,
-                "files_per_min_total": self.finished / elapsed * 60.0,
-                "files_per_min_recent": (recent / span * 60.0) if span > 0 else 0.0,
-                "recent_window_s": span,
-                "avg_duration_s": (sum(durations) / len(durations)) if durations else 0.0,
-            }
-
-
-class ThroughputReporter(threading.Thread):
-    def __init__(
-        self,
-        run_id: str,
-        stats: Stats,
-        sampler: ResourceSampler,
-        path: Path,
-        interval: float,
-        window: float,
-        *,
-        label: str = "files",
-        queue_depth_fn: Any = None,
-    ) -> None:
-        super().__init__(name="throughput-reporter", daemon=True)
-        self._run_id = run_id
-        self._stats = stats
-        self._sampler = sampler
-        self._path = path
-        self._interval = interval
-        self._window = window
-        self._label = label
-        self._queue_depth_fn = queue_depth_fn
-        self._stop = threading.Event()
-
-    def run(self) -> None:
-        while not self._stop.wait(self._interval):
-            try:
-                self.report_once()
-            except Exception:  # noqa: BLE001 - a reporting failure must not kill the run
-                LOG.exception("throughput report failed")
-
-    def stop(self) -> None:
-        self._stop.set()
-
-    def report_once(self) -> None:
-        snap = self._stats.snapshot(self._window)
-        s = self._sampler.latest()
-        queue_depth = None
-        if self._queue_depth_fn is not None:
-            try:
-                queue_depth = self._queue_depth_fn()
-            except Exception:  # noqa: BLE001 - reporting must never break the run
-                queue_depth = None
-        row = {
-            "run_id": self._run_id,
-            "ts": utc_now(),
-            "elapsed_s": round(snap["elapsed_s"], 1),
-            "submitted": snap["submitted"],
-            "finished": snap["finished"],
-            "in_flight": snap["in_flight"],
-            "success": snap["success"],
-            "failed": snap["failed"],
-            "timeout": snap["timed_out"],
-            "aborted": snap["aborted"],
-            "files_per_min_total": round(snap["files_per_min_total"], 2),
-            "files_per_min_recent": round(snap["files_per_min_recent"], 2),
-            "avg_duration_s": round(snap["avg_duration_s"], 2),
-            "chunks": snap["chunks"],
-            "pages": snap["pages"],
-            "cpu_pct": _round(s.cpu_pct),
-            "gpu_util_pct": _round(s.gpu_util_pct),
-            "gpu_mem_used_mib": _round(s.gpu_mem_used_mib),
-            "gpu_mem_total_mib": _round(s.gpu_mem_total_mib),
-            "queue_depth": queue_depth,
-        }
-        append_jsonl(self._path, row)
-        LOG.info(
-            "throughput(%s): finished=%d/%d ok=%d fail=%d abort=%d inflight=%d | "
-            "total=%.2f/min recent=%.2f/min avg=%.1fs | queue=%s cpu=%s%% gpu=%s%% mem=%s MiB",
-            self._label,
-            snap["finished"],
-            snap["submitted"],
-            snap["success"],
-            snap["failed"],
-            snap["aborted"],
-            snap["in_flight"],
-            snap["files_per_min_total"],
-            snap["files_per_min_recent"],
-            snap["avg_duration_s"],
-            "-" if queue_depth is None else queue_depth,
-            _fmt(s.cpu_pct),
-            _fmt(s.gpu_util_pct),
-            _fmt(s.gpu_mem_used_mib, 0),
-        )
-
-
-# --------------------------------------------------------------------------- #
-# per-file submit → poll → persist
+# one file = one worker: submit, poll to terminal, persist the result
 # --------------------------------------------------------------------------- #
 class TaskFailed(Exception):
     pass
 
 
-class Runner:
-    def __init__(
-        self,
-        args: argparse.Namespace,
-        run_id: str,
-        stub: ParseServiceStub,
-        stats: Stats,
-        sampler: ResourceSampler,
-        out_dir: Path,
-        container_root: str,
-    ) -> None:
-        self.args = args
-        self.run_id = run_id
-        self.stub = stub
-        self.stats = stats
-        self.sampler = sampler
-        self.root = Path(args.root).expanduser().resolve()
-        self.results_dir = out_dir / "results"
-        self.container_root = container_root.rstrip("/")
-        self.files_jsonl = out_dir / "files.jsonl"
+def _run_file(idx: int, path_str: str, cfg: dict[str, Any]) -> dict[str, Any]:
+    """Worker entry point: take one file from lookup to a terminal state.
 
-    # -- gRPC ------------------------------------------------------------- #
-    def _submit(self, doc_id: str, source: str) -> str:
-        delay = 1.0
-        for attempt in range(5):
-            try:
-                resp = self.stub.SubmitParse(
-                    ParseRequest(doc_id=doc_id, source=source), timeout=30
-                )
-                return resp.task_id
-            except grpc.RpcError as exc:
-                if exc.code() in RETRYABLE and attempt < 4:
-                    LOG.warning(
-                        "SubmitParse retry %d for %s: %s",
-                        attempt + 1,
-                        doc_id,
-                        exc.details(),
-                    )
-                    time.sleep(delay)
-                    delay *= 2
-                    continue
-                raise
-        raise RuntimeError("unreachable")
+    `cfg["existing"]` holds the newest task per source from the pre-submit
+    `ListTasks`: a SUCCESS is skipped, a FAILED is requeued as a new task, a
+    PENDING/RUNNING is attached to, and a missing entry is submitted.
 
-    def _poll(self, task_id: str):
-        deadline = time.monotonic() + self.args.task_timeout
-        interval = self.args.poll_interval
-        while True:
-            try:
-                resp = self.stub.GetResult(GetResultRequest(task_id=task_id), timeout=60)
-            except grpc.RpcError as exc:
-                if exc.code() in RETRYABLE and time.monotonic() < deadline:
-                    time.sleep(interval)
-                    interval = min(self.args.poll_max_interval, interval * 1.5)
-                    continue
-                raise
-
-            if resp.status == TaskStatus.TASK_STATUS_SUCCESS:
-                return resp
-            if resp.status == TaskStatus.TASK_STATUS_FAILED:
-                raise TaskFailed(resp.error or "task reported FAILED")
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"task {task_id} not finished within {self.args.task_timeout:.0f}s"
-                )
-            time.sleep(interval)
-            interval = min(self.args.poll_max_interval, interval * 1.5)
-
-    # -- persistence ------------------------------------------------------ #
-    def _result_name(self, idx: int, rel: str) -> str:
-        return f"{idx:05d}_{_safe_stem(rel)}.json"
-
-    def _write_result(self, idx: int, rel: str, doc_id: str, task_id: str, source: str, resp) -> None:
-        payload: dict[str, Any] = {
-            "run_id": self.run_id,
-            "doc_id": doc_id,
-            "path": rel,
-            "task_id": task_id,
-            "source": source,
-            "chunk_count": len(resp.chunks),
-            "doc_meta": {},
-            "chunks": [],
-        }
-        if resp.HasField("result"):
-            meta = resp.result.doc_meta
-            payload["doc_meta"] = {
-                "total_pages": meta.total_pages,
-                "title": meta.title,
-                "warning": meta.warning,
-            }
-        if not self.args.no_chunks:
-            payload["chunks"] = [
-                {
-                    "chunk_id": c.chunk_id,
-                    "text": c.text,
-                    "page": c.metadata.page,
-                    "heading": c.metadata.heading,
-                    "chunk_type": c.metadata.chunk_type,
-                }
-                for c in resp.chunks
-            ]
-            payload["chunk_count"] = len(payload["chunks"])
-
-        target = self.results_dir / self._result_name(idx, rel)
-        tmp = target.with_suffix(".json.tmp")
-        with tmp.open("w", encoding="utf-8") as fh:
-            json.dump(payload, fh, ensure_ascii=False)
-        tmp.replace(target)
-
-    # -- one file --------------------------------------------------------- #
-    def run_one(self, idx: int, total: int, path: Path) -> None:
-        rel = path.relative_to(self.root).as_posix()
-        doc_id = _make_doc_id(rel)
-        source = "file://" + quote(f"{self.container_root}/{rel}", safe="/")
-        started_at = utc_now()
-
-        t0 = time.time()
-        before = self.sampler.latest()
-        self.stats.mark_submitted()
-
-        status = "failed"
-        error = ""
-        task_id = ""
-        chunk_count = 0
-        pages = 0
-        title = ""
-        warning = ""
-        timed_out = False
-
-        try:
-            task_id = self._submit(doc_id, source)
-            resp = self._poll(task_id)
-            status = "success"
-            chunk_count = len(resp.chunks)
-            if resp.HasField("result"):
-                pages = resp.result.doc_meta.total_pages
-                title = resp.result.doc_meta.title
-                warning = resp.result.doc_meta.warning
-            self._write_result(idx, rel, doc_id, task_id, source, resp)
-        except TaskFailed as exc:
-            status = "failed"
-            error = str(exc)
-        except TimeoutError as exc:
-            status = "timeout"
-            timed_out = True
-            error = str(exc)
-        except grpc.RpcError as exc:
-            status = "failed"
-            error = f"{exc.code().name}: {exc.details()}"
-        except Exception as exc:  # noqa: BLE001 - record, don't kill the batch
-            status = "failed"
-            error = f"{type(exc).__name__}: {exc}"
-        finally:
-            t1 = time.time()
-            duration = t1 - t0
-            after = self.sampler.latest()
-            peak = self.sampler.peak_between(t0, t1)
-            ok = status == "success"
-            self.stats.mark_finished(
-                ok, duration, chunks=chunk_count, pages=pages, timed_out=timed_out
-            )
-
-            append_jsonl(
-                self.files_jsonl,
-                {
-                    "run_id": self.run_id,
-                    "doc_id": doc_id,
-                    "path": rel,
-                    "task_id": task_id,
-                    "source": source,
-                    "status": status,
-                    "error": error[:4000],
-                    "started_at": started_at,
-                    "finished_at": utc_now(),
-                    "duration_s": round(duration, 3),
-                    "size_bytes": _safe_size(path),
-                    "chunk_count": chunk_count,
-                    "total_pages": pages,
-                    "title": title,
-                    "warning": warning,
-                    "result_file": self._result_name(idx, rel) if ok else None,
-                    "cpu_before_pct": _round(before.cpu_pct),
-                    "cpu_after_pct": _round(after.cpu_pct),
-                    "cpu_peak_pct": _round(peak.cpu_pct),
-                    "gpu_util_before_pct": _round(before.gpu_util_pct),
-                    "gpu_util_after_pct": _round(after.gpu_util_pct),
-                    "gpu_util_peak_pct": _round(peak.gpu_util_pct),
-                    "gpu_mem_before_mib": _round(before.gpu_mem_used_mib),
-                    "gpu_mem_after_mib": _round(after.gpu_mem_used_mib),
-                    "gpu_mem_peak_mib": _round(peak.gpu_mem_used_mib),
-                },
-            )
-
-            LOG.info(
-                "[%d/%d] %-7s %8.1fs chunks=%-5d cpu %s->%s%% gpu %s->%s%% "
-                "mem %s->%s MiB  %s%s",
-                idx + 1,
-                total,
-                status.upper(),
-                duration,
-                chunk_count,
-                _fmt(before.cpu_pct),
-                _fmt(after.cpu_pct),
-                _fmt(before.gpu_util_pct),
-                _fmt(after.gpu_util_pct),
-                _fmt(before.gpu_mem_used_mib, 0),
-                _fmt(after.gpu_mem_used_mib, 0),
-                rel,
-                "" if ok else f"  ({error[:200]})",
-            )
-
-
-# --------------------------------------------------------------------------- #
-# load mode: N virtual users reusing the same files forever
-# --------------------------------------------------------------------------- #
-class LoadAborted(Exception):
-    """The load phase ended while this user was still waiting."""
-
-
-def make_queue_depth_probe(project: str, service: str) -> Any:
-    """Return a callable reporting the Celery queue length, or None.
-
-    Uses `redis-cli LLEN celery` inside the compose Redis container. The probe
-    is best-effort: batch mode passes None, load mode tolerates failures.
+    Never gives up on a retryable transport error or on PENDING/RUNNING: the
+    benchmark's contract is that the worker ends only when the task does.
     """
+    path = Path(path_str)
+    rel = path.relative_to(Path(cfg["root"])).as_posix()
+    doc_id = _make_doc_id(rel)
+    source = _source_uri(rel, cfg["container_root"])
+    results_dir = Path(cfg["results_dir"])
+
+    row: dict[str, Any] = {
+        "run_id": cfg["run_id"],
+        "index": idx,
+        "doc_id": doc_id,
+        "path": rel,
+        "task_id": "",
+        "source": source,
+        "action": "",
+        "status": "failed",
+        "error": "",
+        "submitted_at": None,
+        "started_at": None,
+        "finished_at": None,
+        "submit_s": None,
+        "queue_s": None,
+        "exec_s": None,
+        "total_s": None,
+        "polls": 0,
+        "size_bytes": _safe_size(path),
+        "chunk_count": 0,
+        "total_pages": 0,
+        "title": "",
+        "warning": "",
+        "result_file": None,
+    }
+
+    existing = cfg["existing"].get(source)
+    if existing is not None and existing.status == TaskStatus.TASK_STATUS_SUCCESS:
+        # Already parsed by an earlier call: resubmitting is rejected by
+        # design (one task per source), and there is nothing left to do.
+        row["task_id"] = existing.task_id
+        row["action"] = "skipped"
+        row["status"] = "skipped"
+        row["finished_at"] = utc_now()
+        return row
+
+    channel = grpc.insecure_channel(
+        cfg["addr"],
+        options=[("grpc.max_receive_message_length", GRPC_MAX_MESSAGE_BYTES)],
+    )
+    stub = ParseServiceStub(channel)
+    t0 = time.monotonic()
+    t_submitted: float | None = None
+    t_done: float | None = None
+    started: float | None = None
+
     try:
-        containers = discover_workers(project, service)
-    except RuntimeError:
-        return None
-    if not containers:
-        return None
-    cid = containers[0]
-
-    def probe() -> int | None:
-        try:
-            out = _docker("exec", cid, "redis-cli", "llen", "celery", timeout=10)
-            return int(out.strip())
-        except (RuntimeError, ValueError):
-            return None
-
-    return probe
-
-
-class LoadRunner:
-    """N virtual users, each looping submit -> poll -> record over shared files.
-
-    Files are handed out round-robin from a shared cursor, so every file is
-    reused and the initial burst spreads across the whole corpus instead of
-    piling onto the alphabetically first ones.
-    """
-
-    def __init__(
-        self,
-        args: argparse.Namespace,
-        run_id: str,
-        files: list[Path],
-        stats: Stats,
-        sampler: ResourceSampler,
-        out_dir: Path,
-        container_root: str,
-    ) -> None:
-        self.args = args
-        self.run_id = run_id
-        self.files = list(files)
-        if args.shuffle:
-            random.shuffle(self.files)
-        self.stats = stats
-        self.sampler = sampler
-        self.root = Path(args.root).expanduser().resolve()
-        self.results_dir = out_dir / "results"
-        self.requests_path = out_dir / "requests.jsonl"
-        self.container_root = container_root.rstrip("/")
-
-        self.channel_count = args.channels or max(
-            4, min(256, math.ceil(args.users / 100))
-        )
-        # At 10k users a 0.5s poll interval means 20k GetResult/s; scale the
-        # floor with the user count so the poller itself is not the bottleneck.
-        self.poll_start = min(30.0, max(args.poll_interval, args.users / 2000.0))
-        self.poll_max = max(args.poll_max_interval, min(120.0, self.poll_start * 3))
-
-        self._cursor = 0
-        self._load_deadline: float | None = None
-        self._channels: list[Any] = []
-        self._stubs: list[ParseServiceStub] = []
-        self._sem: asyncio.Semaphore | None = None
-        self._submit_latencies: deque[float] = deque(maxlen=200_000)
-        self._wait_latencies: deque[float] = deque(maxlen=200_000)
-        self._queue_latencies: deque[float] = deque(maxlen=200_000)
-        self._errors: Counter[str] = Counter()
-
-    # -- work distribution ------------------------------------------------ #
-    def _next_file(self) -> Path:
-        path = self.files[self._cursor % len(self.files)]
-        self._cursor += 1
-        return path
-
-    # -- gRPC ------------------------------------------------------------- #
-    async def _submit(
-        self,
-        stub: ParseServiceStub,
-        doc_id: str,
-        source: str,
-        qwait: list[float],
-    ) -> Any:
-        assert self._sem is not None
-        delay = 1.0
-        for attempt in range(5):
-            tq = time.monotonic()
-            try:
-                async with self._sem:
-                    qwait[0] += time.monotonic() - tq
-                    return await stub.SubmitParse(
+        if existing is not None and existing.status == TaskStatus.TASK_STATUS_FAILED:
+            # Retry: requeue inserts a NEW task for the same source, leaving
+            # the failed record as history. Poll the new id.
+            row["action"] = "requeued"
+            for attempt in range(SUBMIT_ATTEMPTS):
+                try:
+                    requeued = stub.RequeueParse(
+                        RequeueParseRequest(task_id=existing.task_id), timeout=30
+                    )
+                    row["task_id"] = requeued.task_id
+                    break
+                except grpc.RpcError as exc:
+                    if exc.code() in RETRYABLE and attempt < SUBMIT_ATTEMPTS - 1:
+                        time.sleep(min(cfg["poll_max_interval"], 2.0**attempt))
+                        continue
+                    raise
+        elif existing is not None:
+            # PENDING or RUNNING: the document is already in the pipeline, so
+            # do not create a second task — just wait for this one.
+            row["action"] = "attached"
+            row["task_id"] = existing.task_id
+        else:
+            row["action"] = "submitted"
+            for attempt in range(SUBMIT_ATTEMPTS):
+                try:
+                    sub = stub.SubmitParse(
                         ParseRequest(doc_id=doc_id, source=source), timeout=30
                     )
-            except grpc.aio.AioRpcError as exc:
-                # SubmitParse creates a task per call, so a timeout might hide
-                # an already-enqueued task; only retry when it never arrived.
-                if exc.code() in SUBMIT_RETRYABLE and attempt < 4:
-                    await asyncio.sleep(delay)
-                    delay *= 2
-                    continue
-                raise
-        raise RuntimeError("unreachable")
+                    row["task_id"] = sub.task_id
+                    break
+                except grpc.RpcError as exc:
+                    if exc.code() in RETRYABLE and attempt < SUBMIT_ATTEMPTS - 1:
+                        time.sleep(min(cfg["poll_max_interval"], 2.0**attempt))
+                        continue
+                    raise
 
-    async def _poll(
-        self,
-        stub: ParseServiceStub,
-        task_id: str,
-        deadline: float,
-        qwait: list[float],
-    ):
-        assert self._sem is not None
-        interval = self.poll_start
-        polls = 0
+        t_submitted = time.monotonic()
+        row["submitted_at"] = utc_now()
+        row["submit_s"] = round(t_submitted - t0, 4)
+
+        interval = cfg["poll_interval"]
+        success_resp = None
         while True:
-            tq = time.monotonic()
             try:
-                async with self._sem:
-                    qwait[0] += time.monotonic() - tq
-                    resp = await stub.GetResult(
-                        GetResultRequest(task_id=task_id), timeout=60
-                    )
-                    polls += 1
-            except grpc.aio.AioRpcError as exc:
-                now = time.monotonic()
-                if (
-                    exc.code() in RETRYABLE
-                    and now < deadline
-                    and (self._load_deadline is None or now < self._load_deadline)
-                ):
-                    sleep_s = interval
-                    if self._load_deadline is not None:
-                        sleep_s = min(sleep_s, max(0.05, self._load_deadline - now))
-                    await asyncio.sleep(sleep_s)
-                    interval = min(self.poll_max, interval * 1.5)
+                resp = stub.GetResult(
+                    GetResultRequest(task_id=row["task_id"]), timeout=60
+                )
+                row["polls"] += 1
+            except grpc.RpcError as exc:
+                if exc.code() in RETRYABLE:
+                    time.sleep(interval)
+                    interval = min(cfg["poll_max_interval"], interval * 1.5)
                     continue
-                if self._load_deadline is not None and now >= self._load_deadline:
-                    raise LoadAborted("load phase ended while polling") from exc
                 raise
 
-            if resp.status == TaskStatus.TASK_STATUS_SUCCESS:
-                return resp, polls
-            if resp.status == TaskStatus.TASK_STATUS_FAILED:
+            if resp.status == TaskStatus.TASK_STATUS_RUNNING:
+                if started is None:
+                    started = time.monotonic()
+                    row["started_at"] = utc_now()
+            elif resp.status == TaskStatus.TASK_STATUS_SUCCESS:
+                success_resp = resp
+                t_done = time.monotonic()
+                break
+            elif resp.status == TaskStatus.TASK_STATUS_FAILED:
+                t_done = time.monotonic()
                 raise TaskFailed(resp.error or "task reported FAILED")
 
-            now = time.monotonic()
-            if self._load_deadline is not None and now >= self._load_deadline:
-                raise LoadAborted("load phase ended while waiting for the result")
-            if now >= deadline:
-                raise TimeoutError(
-                    f"task {task_id} not finished within {self.args.task_timeout:.0f}s"
-                )
-            sleep_s = interval * (0.8 + random.random() * 0.4)
-            if self._load_deadline is not None:
-                sleep_s = min(sleep_s, max(0.05, self._load_deadline - now))
-            await asyncio.sleep(max(0.05, sleep_s))
-            interval = min(self.poll_max, interval * 1.5)
+            # PENDING / RUNNING / UNSPECIFIED: keep waiting.
+            time.sleep(interval)
+            interval = min(cfg["poll_max_interval"], interval * 1.5)
 
-    # -- persistence ------------------------------------------------------ #
-    def _save_result(
-        self, uid: int, seq: int, rel: str, doc_id: str, task_id: str,
-        source: str, resp: Any,
-    ) -> None:
+        assert success_resp is not None
+        row["status"] = "success"
+        row["chunk_count"] = len(success_resp.chunks)
+        if success_resp.HasField("result"):
+            meta = success_resp.result.doc_meta
+            row["total_pages"] = meta.total_pages
+            row["title"] = meta.title
+            row["warning"] = meta.warning
+
         payload: dict[str, Any] = {
-            "run_id": self.run_id,
-            "user_id": uid,
-            "seq": seq,
+            "run_id": cfg["run_id"],
             "doc_id": doc_id,
             "path": rel,
-            "task_id": task_id,
+            "task_id": row["task_id"],
             "source": source,
-            "chunk_count": len(resp.chunks),
-            "doc_meta": {},
+            "chunk_count": row["chunk_count"],
+            "doc_meta": {
+                "total_pages": row["total_pages"],
+                "title": row["title"],
+                "warning": row["warning"],
+            },
             "chunks": [],
         }
-        if resp.HasField("result"):
-            meta = resp.result.doc_meta
-            payload["doc_meta"] = {
-                "total_pages": meta.total_pages,
-                "title": meta.title,
-                "warning": meta.warning,
-            }
-        if not self.args.no_chunks:
+        if not cfg["no_chunks"]:
             payload["chunks"] = [
                 {
                     "chunk_id": c.chunk_id,
@@ -1134,352 +580,43 @@ class LoadRunner:
                     "heading": c.metadata.heading,
                     "chunk_type": c.metadata.chunk_type,
                 }
-                for c in resp.chunks
+                for c in success_resp.chunks
             ]
-        target = self.results_dir / f"load_{uid}_{seq:05d}_{_safe_stem(rel)}.json"
+
+        result_name = f"{idx:05d}_{_safe_stem(rel)}.json"
+        target = results_dir / result_name
         tmp = target.with_suffix(".json.tmp")
         with tmp.open("w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False)
         tmp.replace(target)
-
-    # -- one user request -------------------------------------------------- #
-    async def _one(self, stub: ParseServiceStub, uid: int, seq: int) -> None:
-        path = self._next_file()
-        rel = path.relative_to(self.root).as_posix()
-        doc_id = _make_doc_id(f"u{uid}-r{seq}-{rel}")
-        source = "file://" + quote(f"{self.container_root}/{rel}", safe="/")
-        started_at = utc_now()
-        t0 = time.monotonic()
-        qwait = [0.0]  # seconds spent waiting for a client-side RPC slot
-        self.stats.mark_submitted()
-
-        status = "error"
-        error = ""
-        task_id = ""
-        submit_s: float | None = None
-        polls = 0
-        chunk_count = 0
-        pages = 0
-        title = ""
-        warning = ""
-        preview = ""
-
-        try:
-            sub = await self._submit(stub, doc_id, source, qwait)
-            task_id = sub.task_id
-            submit_s = time.monotonic() - t0
-            resp, polls = await self._poll(
-                stub, task_id, t0 + self.args.task_timeout, qwait
-            )
-
-            status = "success"
-            chunk_count = len(resp.chunks)
-            if resp.HasField("result"):
-                pages = resp.result.doc_meta.total_pages
-                title = resp.result.doc_meta.title
-                warning = resp.result.doc_meta.warning
-            if resp.chunks:
-                preview = resp.chunks[0].text[:120]
-            if self.args.save_results:
-                self._save_result(uid, seq, rel, doc_id, task_id, source, resp)
-        except TaskFailed as exc:
-            status, error = "failed", str(exc)
-        except LoadAborted as exc:
-            status, error = "aborted", str(exc)
-        except TimeoutError as exc:
-            status, error = "timeout", str(exc)
-        except asyncio.CancelledError:
-            status, error = "aborted", "cancelled (load stopped)"
-            raise
-        except grpc.aio.AioRpcError as exc:
-            status, error = "error", f"{exc.code().name}: {exc.details()}"
-        except Exception as exc:  # noqa: BLE001 - one bad request must not stop a user
-            status, error = "error", f"{type(exc).__name__}: {exc}"
-        finally:
-            total_s = time.monotonic() - t0
-            wait_s = None if submit_s is None else max(0.0, total_s - submit_s)
-            ok = status == "success"
-            self.stats.mark_finished(
-                ok,
-                total_s,
-                chunks=chunk_count,
-                pages=pages,
-                timed_out=status == "timeout",
-                aborted=status == "aborted",
-            )
-            if submit_s is not None:
-                self._submit_latencies.append(submit_s)
-            if wait_s is not None:
-                self._wait_latencies.append(wait_s)
-            self._queue_latencies.append(qwait[0])
-            if not ok:
-                self._errors[f"{status}: {error[:120]}".strip()] += 1
-            append_jsonl(
-                self.requests_path,
-                {
-                    "run_id": self.run_id,
-                    "user_id": uid,
-                    "seq": seq,
-                    "path": rel,
-                    "doc_id": doc_id,
-                    "task_id": task_id,
-                    "source": source,
-                    "status": status,
-                    "error": error[:2000],
-                    "started_at": started_at,
-                    "finished_at": utc_now(),
-                    "queue_s": round(qwait[0], 3),
-                    "submit_s": _round(submit_s, 4),
-                    "wait_s": _round(wait_s, 3),
-                    "total_s": round(total_s, 3),
-                    "polls": polls,
-                    "chunk_count": chunk_count,
-                    "total_pages": pages,
-                    "title": title,
-                    "warning": warning,
-                    "first_chunk": preview,
-                    "size_bytes": _safe_size(path),
-                },
-            )
-
-    # -- loop driver ------------------------------------------------------ #
-    async def _user(self, uid: int) -> None:
-        stub = self._stubs[uid % len(self._stubs)]
-        seq = 0
-        while True:
-            if self._load_deadline is not None and time.monotonic() >= self._load_deadline:
-                return
-            if self.args.requests_per_user and seq >= self.args.requests_per_user:
-                return
-            await self._one(stub, uid, seq)
-            seq += 1
-
-    async def _delayed_user(self, uid: int, delay: float) -> None:
-        if delay > 0:
-            await asyncio.sleep(delay)
-        await self._user(uid)
-
-    async def run(self) -> None:
-        if self.args.duration > 0:
-            self._load_deadline = time.monotonic() + self.args.duration
-
-        options = [("grpc.max_receive_message_length", GRPC_MAX_MESSAGE_BYTES)]
-        self._channels = [
-            grpc.aio.insecure_channel(self.args.addr, options=options)
-            for _ in range(self.channel_count)
-        ]
-        self._stubs = [ParseServiceStub(ch) for ch in self._channels]
-        self._sem = asyncio.Semaphore(self.args.max_inflight)
-        LOG.info(
-            "load: %d user(s), %d gRPC channel(s), max %d in flight, "
-            "poll %.1fs..%.1fs over %d file(s)",
-            self.args.users, self.channel_count, self.args.max_inflight,
-            self.poll_start, self.poll_max, len(self.files),
-        )
-
-        tasks = []
-        for uid in range(self.args.users):
-            delay = self.args.ramp_up * uid / self.args.users if self.args.ramp_up > 0 else 0.0
-            tasks.append(asyncio.create_task(self._delayed_user(uid, delay)))
-        try:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        finally:
-            for ch in self._channels:
-                try:
-                    await ch.close()
-                except Exception:  # noqa: BLE001 - best-effort shutdown
-                    pass
-
-
-def _latency_summary(values: deque[float]) -> dict[str, Any]:
-    ordered = sorted(values)
-    if not ordered:
-        return {"count": 0, "mean": None, "p50": None, "p90": None, "p95": None, "max": None}
-    return {
-        "count": len(ordered),
-        "mean": round(sum(ordered) / len(ordered), 4),
-        "p50": _round(_percentile(ordered, 0.50), 4),
-        "p90": _round(_percentile(ordered, 0.90), 4),
-        "p95": _round(_percentile(ordered, 0.95), 4),
-        "max": round(ordered[-1], 4),
-    }
-
-
-def _write_load_summary(
-    out_dir: Path,
-    run_id: str,
-    args: argparse.Namespace,
-    files: list[Path],
-    skipped: dict[str, int],
-    stats: Stats,
-    sampler: ResourceSampler,
-    containers: list[str],
-    container_root: str,
-    staged: bool,
-    staged_bytes: int,
-    started_at: str,
-    interrupted: bool,
-    runner: LoadRunner,
-) -> dict[str, Any]:
-    snap = stats.snapshot(args.window)
-    summary = {
-        "run_id": run_id,
-        "mode": "load",
-        "started_at": started_at,
-        "finished_at": utc_now(),
-        "interrupted": interrupted,
-        "config": {
-            "root": str(Path(args.root).expanduser().resolve()),
-            "addr": args.addr,
-            "ext": args.ext,
-            "limit": args.limit,
-            "users": args.users,
-            "duration_s": args.duration,
-            "ramp_up_s": args.ramp_up,
-            "channels": runner.channel_count,
-            "max_inflight": args.max_inflight,
-            "requests_per_user": args.requests_per_user,
-            "task_timeout_s": args.task_timeout,
-            "poll_start_s": round(runner.poll_start, 3),
-            "poll_max_s": round(runner.poll_max, 3),
-            "stage": args.stage,
-            "container_root": container_root,
-        },
-        "files": {
-            "selected": len(files),
-            "skipped_by_reason": skipped,
-            "requests_jsonl": str(out_dir / "requests.jsonl"),
-        },
-        "outcome": {
-            "submitted": snap["submitted"],
-            "success": snap["success"],
-            "failed": snap["failed"],
-            "timed_out": snap["timed_out"],
-            "aborted": snap["aborted"],
-            "not_finished": snap["in_flight"],
-        },
-        "latency_s": {
-            # Time waiting for a client-side RPC slot, before submit/poll.
-            "client_queue": _latency_summary(runner._queue_latencies),
-            "submit": _latency_summary(runner._submit_latencies),
-            "wait": _latency_summary(runner._wait_latencies),
-            "total": _latency_summary(stats.durations),
-        },
-        "work": {"chunks": snap["chunks"], "pages": snap["pages"]},
-        "errors": dict(runner._errors.most_common(25)),
-        "throughput": {
-            "requests_per_min_total": round(snap["files_per_min_total"], 3),
-            "requests_per_min_recent": round(snap["files_per_min_recent"], 3),
-            "window_s": round(snap["recent_window_s"], 1),
-            "elapsed_s": round(snap["elapsed_s"], 1),
-        },
-        "resources": sampler.overall_peaks(),
-        "staging": {
-            "mode": (
-                "staged"
-                if staged
-                else ("pre-mounted" if args.stage == "auto" and containers else "none")
-            ),
-            "enabled": staged,
-            "workers": [c[:12] for c in containers],
-            "container_root": container_root,
-            "staged_bytes": staged_bytes,
-            # Load mode leaves staged files in the workers for the queued
-            # tasks that outlive the load phase.
-            "retained": bool(staged and containers),
-        },
-    }
-    target = out_dir / "summary.json"
-    tmp = target.with_suffix(".json.tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        json.dump(summary, fh, ensure_ascii=False, indent=2)
-    tmp.replace(target)
-    return summary
-
-
-def run_load(
-    args: argparse.Namespace,
-    run_id: str,
-    started_at: str,
-    out_dir: Path,
-    files: list[Path],
-    skipped: dict[str, int],
-    containers: list[str],
-    container_root: str,
-    staged: bool,
-    staged_bytes: int,
-) -> int:
-    """Drive the virtual-user load phase and persist its logs."""
-    stats = Stats()
-    sampler = ResourceSampler(args.sample_interval)
-    sampler.start()
-    reporter = ThroughputReporter(
-        run_id,
-        stats,
-        sampler,
-        out_dir / "throughput.jsonl",
-        args.throughput_interval,
-        args.window,
-        label="requests",
-        queue_depth_fn=make_queue_depth_probe(args.project, args.redis_service),
-    )
-    reporter.start()
-    runner = LoadRunner(args, run_id, files, stats, sampler, out_dir, container_root)
-
-    LOG.info(
-        "load: %d user(s) over %d file(s), %d request(s)/user%s; responses -> %s",
-        args.users,
-        len(files),
-        args.requests_per_user or "unlimited",
-        "" if args.ramp_up <= 0 and args.duration <= 0
-        else f" (ramp-up {args.ramp_up:.0f}s"
-        + (f", safety limit {args.duration:.0f}s)" if args.duration > 0 else ")"),
-        runner.requests_path,
-    )
-    interrupted = False
-    try:
-        asyncio.run(runner.run())
-    except KeyboardInterrupt:
-        interrupted = True
-        LOG.warning("load interrupted; in-flight requests were aborted")
+        row["result_file"] = result_name
+    except TaskFailed as exc:
+        row["status"] = "failed"
+        row["error"] = str(exc)
+    except grpc.RpcError as exc:
+        row["status"] = "failed"
+        row["error"] = f"{exc.code().name}: {exc.details()}"
+    except Exception as exc:  # noqa: BLE001 - record, don't kill the batch
+        row["status"] = "failed"
+        row["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        sampler.stop()
-        reporter.stop()
-        try:
-            reporter.report_once()
-        except Exception:  # noqa: BLE001
-            LOG.exception("final throughput row failed")
-        summary = _write_load_summary(
-            out_dir, run_id, args, files, skipped, stats, sampler,
-            containers, container_root, staged, staged_bytes,
-            started_at, interrupted, runner,
-        )
-        # Unlike batch mode, tasks aborted at the deadline are still queued and
-        # will read their source later, so staged files must stay until the
-        # workers drain the backlog.
-        if staged and containers:
-            LOG.warning(
-                "keeping staged files at %s: queued tasks still need them. "
-                "Remove when the queue is empty: docker exec <worker> rm -rf %s",
-                container_root,
-                container_root,
-            )
+        channel.close()
+        if t_done is None:
+            t_done = time.monotonic()
+        row["finished_at"] = utc_now()
+        if t_submitted is None:
+            row["total_s"] = round(t_done - t0, 3)
+        else:
+            row["total_s"] = round(t_done - t_submitted, 3)
+            if started is not None:
+                row["queue_s"] = round(started - t_submitted, 3)
+                row["exec_s"] = round(t_done - started, 3)
+        # A transport error before SubmitParse completed leaves started unset.
+        if started is None and row["status"] == "success":
+            row["queue_s"] = None
+            row["exec_s"] = None
 
-    outcome = summary["outcome"]
-    LOG.info(
-        "load done: success=%d failed=%d timeout=%d aborted=%d still_in_flight=%d "
-        "over %.1fs",
-        outcome["success"],
-        outcome["failed"],
-        outcome["timed_out"],
-        outcome["aborted"],
-        outcome["not_finished"],
-        summary["throughput"]["elapsed_s"],
-    )
-    LOG.info(
-        "note: queued Celery tasks keep running server-side; the API has no cancel"
-    )
-    return 130 if interrupted else 0
+    return row
 
 
 # --------------------------------------------------------------------------- #
@@ -1547,6 +684,105 @@ def load_successful_paths(out_dir: Path) -> set[str]:
 
 
 # --------------------------------------------------------------------------- #
+# summary
+# --------------------------------------------------------------------------- #
+def _write_summary(
+    out_dir: Path,
+    run_id: str,
+    started_at: str,
+    args: argparse.Namespace,
+    files: list[Path],
+    skipped: dict[str, int],
+    skipped_resume: int,
+    rows: list[dict[str, Any]],
+    wall_s: float,
+    interrupted: bool,
+    containers: list[str],
+    container_root: str,
+    staged: bool,
+    staged_bytes: int,
+) -> dict[str, Any]:
+    success = sum(1 for r in rows if r["status"] == "success")
+    failed = sum(1 for r in rows if r["status"] == "failed")
+    skipped_existing = sum(1 for r in rows if r["status"] == "skipped")
+    submitted = sum(1 for r in rows if r.get("action") == "submitted")
+    requeued = sum(1 for r in rows if r.get("action") == "requeued")
+    attached = sum(1 for r in rows if r.get("action") == "attached")
+    queue_values = [r["queue_s"] for r in rows if r["queue_s"] is not None]
+    exec_values = [r["exec_s"] for r in rows if r["exec_s"] is not None]
+    total_values = [r["total_s"] for r in rows if r["total_s"] is not None]
+    submit_values = [r["submit_s"] for r in rows if r["submit_s"] is not None]
+    completed = success + failed + skipped_existing
+
+    summary = {
+        "run_id": run_id,
+        "started_at": started_at,
+        "finished_at": utc_now(),
+        "interrupted": interrupted,
+        "config": {
+            "root": str(Path(args.root).expanduser().resolve()),
+            "addr": args.addr,
+            "ext": args.ext,
+            "exclude": args.exclude,
+            "limit": args.limit,
+            "no_chunks": args.no_chunks,
+            "poll_interval_s": args.poll_interval,
+            "poll_max_interval_s": args.poll_max_interval,
+            "workers": len(files),
+            "stage": args.stage,
+            "container_root": container_root,
+            "project": args.project,
+            "service": args.service,
+        },
+        "files": {
+            "selected": len(files),
+            "skipped_resume": skipped_resume,
+            "skipped_by_reason": skipped,
+        },
+        "outcome": {
+            "submitted": submitted,
+            "requeued": requeued,
+            "attached": attached,
+            "skipped_existing": skipped_existing,
+            "success": success,
+            "failed": failed,
+            "not_finished": max(0, len(files) - completed),
+        },
+        "timings_s": {
+            "submit": _summary_stats(submit_values),
+            "queue": _summary_stats(queue_values),
+            "exec": _summary_stats(exec_values),
+            "total": _summary_stats(total_values),
+            "started_unobserved": sum(1 for r in rows if r["started_at"] is None),
+            "wall": round(wall_s, 3),
+        },
+        "throughput": {
+            "completed": completed,
+            "wall_s": round(wall_s, 3),
+            "files_per_s": round(completed / wall_s, 4) if wall_s > 0 else None,
+            "files_per_min": round(completed / wall_s * 60.0, 3) if wall_s > 0 else None,
+        },
+        "staging": {
+            "mode": (
+                "staged"
+                if staged
+                else ("pre-mounted" if args.stage == "auto" and containers else "none")
+            ),
+            "enabled": staged,
+            "workers": [c[:12] for c in containers],
+            "container_root": container_root,
+            "staged_bytes": staged_bytes,
+        },
+    }
+    target = out_dir / "summary.json"
+    tmp = target.with_suffix(".json.tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(summary, fh, ensure_ascii=False, indent=2)
+    tmp.replace(target)
+    return summary
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1569,18 +805,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--resume", action="store_true",
                     help="skip files already recorded as successful in --out-dir")
     ap.add_argument("--include-empty", action="store_true", help="do not skip 0-byte files")
-    ap.add_argument("--concurrency", type=int, default=4,
-                    help="max files in flight (submitted but not finished)")
-    ap.add_argument("--task-timeout", type=float, default=2400.0,
-                    help="give up on one file after N seconds (keep above MINERU_TIMEOUT)")
-    ap.add_argument("--poll-interval", type=float, default=0.5)
-    ap.add_argument("--poll-max-interval", type=float, default=5.0)
-    ap.add_argument("--sample-interval", type=float, default=2.0,
-                    help="seconds between CPU/GPU samples")
-    ap.add_argument("--throughput-interval", type=float, default=10.0,
-                    help="seconds between throughput log rows")
-    ap.add_argument("--window", type=float, default=60.0,
-                    help="recent-throughput window in seconds")
+    ap.add_argument("--poll-interval", type=float, default=0.5,
+                    help="initial GetResult interval per task (seconds)")
+    ap.add_argument("--poll-max-interval", type=float, default=5.0,
+                    help="maximum GetResult backoff (seconds)")
     ap.add_argument("--stage", choices=("auto", "none"), default="auto",
                     help="auto: tar the selected files into every worker container; "
                     "none: assume they are already readable in the containers")
@@ -1593,121 +821,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     help="do not delete staged files from the containers when done")
     ap.add_argument("--no-chunks", action="store_true",
                     help="persist only metadata, not chunk text")
-    # ---- load mode (virtual users) ------------------------------------- #
-    ap.add_argument("--users", type=int, default=0, metavar="N",
-                    help="load mode: N virtual users, each submits a parse of "
-                    "a file from the directory and exits once it has the "
-                    "result (0 = one pass per file, batch mode)")
-    ap.add_argument("--duration", type=float, default=0.0, metavar="SEC",
-                    help="load mode: safety limit, stop after SEC seconds "
-                    "(0 = run until every user got its result)")
-    ap.add_argument("--ramp-up", type=float, default=0.0, metavar="SEC",
-                    help="load mode: spread user starts over SEC seconds")
-    ap.add_argument("--channels", type=int, default=0,
-                    help="load mode: number of gRPC channels "
-                    "(default: users/100 clamped to 4..256)")
-    ap.add_argument("--max-inflight", type=int, default=512, metavar="N",
-                    help="load mode: max RPCs started at once (client-side "
-                    "queue; grpc.aio cancels calls beyond a few thousand "
-                    "simultaneous ones)")
-    ap.add_argument("--requests-per-user", type=int, default=1, metavar="N",
-                    help="load mode: requests per user before it exits "
-                    "(default 1; 0 = keep going until --duration / Ctrl-C)")
-    ap.add_argument("--shuffle", action="store_true",
-                    help="load mode: randomise the order files are handed out")
-    ap.add_argument("--save-results", action="store_true",
-                    help="load mode: also persist every successful chunk payload "
-                    "(off by default: 10k users produce a lot of data)")
-    ap.add_argument("--redis-service", default="redis",
-                    help="compose service label of Redis, used for queue-depth logs")
     ap.add_argument("--dry-run", action="store_true",
                     help="enumerate and show the staging plan, then exit")
     return ap.parse_args(argv)
-
-
-def _write_summary(
-    out_dir: Path,
-    run_id: str,
-    args: argparse.Namespace,
-    files: list[Path],
-    skipped: dict[str, int],
-    skipped_resume: int,
-    stats: Stats,
-    sampler: ResourceSampler,
-    interrupted: bool,
-    containers: list[str],
-    container_root: str,
-    staged: bool,
-    staged_bytes: int,
-    started_at: str,
-) -> dict[str, Any]:
-    snap = stats.snapshot(args.window)
-    durations = sorted(stats.durations)
-    summary = {
-        "run_id": run_id,
-        "started_at": started_at,
-        "finished_at": utc_now(),
-        "interrupted": interrupted,
-        "config": {
-            "root": str(Path(args.root).expanduser().resolve()),
-            "addr": args.addr,
-            "ext": args.ext,
-            "exclude": args.exclude,
-            "limit": args.limit,
-            "concurrency": args.concurrency,
-            "task_timeout_s": args.task_timeout,
-            "stage": args.stage,
-            "container_root": container_root,
-            "project": args.project,
-            "service": args.service,
-            "window_s": args.window,
-        },
-        "files": {
-            "selected": len(files),
-            "skipped_resume": skipped_resume,
-            "skipped_by_reason": skipped,
-        },
-        "outcome": {
-            "submitted": snap["submitted"],
-            "success": snap["success"],
-            "failed": snap["failed"],
-            "timed_out": snap["timed_out"],
-            "not_started": max(0, len(files) - snap["submitted"]),
-        },
-        "throughput": {
-            "files_per_min_total": round(snap["files_per_min_total"], 3),
-            "files_per_min_recent": round(snap["files_per_min_recent"], 3),
-            "window_s": round(snap["recent_window_s"], 1),
-            "elapsed_s": round(snap["elapsed_s"], 1),
-        },
-        "duration_s": {
-            "mean": round(snap["avg_duration_s"], 3),
-            "p50": _round(_percentile(durations, 0.50), 3),
-            "p90": _round(_percentile(durations, 0.90), 3),
-            "p95": _round(_percentile(durations, 0.95), 3),
-            "max": _round(max(durations), 3) if durations else None,
-            "sum": round(sum(durations), 3),
-        },
-        "work": {"chunks": snap["chunks"], "pages": snap["pages"]},
-        "resources": sampler.overall_peaks(),
-        "staging": {
-            "mode": (
-                "staged"
-                if staged
-                else ("pre-mounted" if args.stage == "auto" and containers else "none")
-            ),
-            "enabled": staged,
-            "workers": [c[:12] for c in containers],
-            "container_root": container_root,
-            "staged_bytes": staged_bytes,
-        },
-    }
-    target = out_dir / "summary.json"
-    tmp = target.with_suffix(".json.tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        json.dump(summary, fh, ensure_ascii=False, indent=2)
-    tmp.replace(target)
-    return summary
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1738,12 +854,7 @@ def main(argv: list[str] | None = None) -> int:
     files, skipped = enumerate_files(root, exts, args.exclude, args.include_empty)
 
     skipped_resume = 0
-    if args.resume and args.users > 0:
-        LOG.warning(
-            "--resume is batch-mode only; ignoring it with --users "
-            "(load mode reuses every file by design)"
-        )
-    elif args.resume:
+    if args.resume:
         done = load_successful_paths(out_dir)
         before = len(files)
         files = [p for p in files if p.relative_to(root).as_posix() not in done]
@@ -1776,7 +887,6 @@ def main(argv: list[str] | None = None) -> int:
             containers = discover_workers(args.project, args.service)
             mounted = detect_mounted_root(containers, root) if containers else None
             if mounted:
-                container_root = mounted
                 LOG.info(
                     "dry run: %d worker(s) already mount %s at %s; staging would be skipped",
                     len(containers),
@@ -1786,21 +896,12 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 LOG.info("dry run: would stage into %d worker(s): %s",
                          len(containers), ", ".join(c[:12] for c in containers) or "-")
-        if args.users > 0:
-            LOG.info(
-                "dry run: load mode would drive %d user(s) for %s over %d file(s), "
-                "ramp-up %.0fs, %s",
-                args.users,
-                "Ctrl-C" if args.duration <= 0 else f"{args.duration:.0f}s",
-                len(files),
-                args.ramp_up,
-                f"{args.requests_per_user} request(s)/user"
-                if args.requests_per_user
-                else "until stopped",
-            )
-        else:
-            LOG.info("dry run: would submit %d file(s) as file://%s/<rel>",
-                     len(files), container_root)
+        LOG.info(
+            "dry run: would submit %d file(s) at once, one worker per file, "
+            "sources file://%s/<rel>",
+            len(files),
+            container_root,
+        )
         return 0
 
     # Fail fast if the control plane is unreachable.
@@ -1814,7 +915,7 @@ def main(argv: list[str] | None = None) -> int:
         LOG.error("cannot reach ParseService at %s", args.addr)
         channel.close()
         return 2
-    stub = ParseServiceStub(channel)
+    channel.close()
 
     if args.stage == "auto":
         containers = discover_workers(args.project, args.service)
@@ -1826,7 +927,6 @@ def main(argv: list[str] | None = None) -> int:
                 args.service,
                 args.project,
             )
-            channel.close()
             return 2
         mounted = detect_mounted_root(containers, root)
         if mounted is not None:
@@ -1854,11 +954,9 @@ def main(argv: list[str] | None = None) -> int:
             except KeyboardInterrupt:
                 LOG.warning("interrupted during staging; removing partial files")
                 cleanup_staged(containers, container_root)
-                channel.close()
                 return 130
             except RuntimeError as exc:
                 LOG.error("staging failed: %s", exc)
-                channel.close()
                 return 2
             staged = True
     else:
@@ -1867,99 +965,165 @@ def main(argv: list[str] | None = None) -> int:
             container_root,
         )
 
-    if args.users > 0:
-        channel.close()
-        return run_load(
-            args,
-            run_id,
-            started_at,
-            out_dir,
-            files,
-            skipped,
-            containers,
-            container_root,
-            staged,
-            staged_bytes if staged else 0,
-        )
-
-    stats = Stats()
-    sampler = ResourceSampler(args.sample_interval)
-    sampler.start()
-    reporter = ThroughputReporter(
-        run_id, stats, sampler, out_dir / "throughput.jsonl",
-        args.throughput_interval, args.window,
-    )
-    reporter.start()
-
-    runner = Runner(args, run_id, stub, stats, sampler, out_dir, container_root)
-    executor = ThreadPoolExecutor(max_workers=args.concurrency, thread_name_prefix="submit")
-    interrupted = False
+    # One lookup for the whole selection: the per-source decision (submit /
+    # skip / requeue / attach) must not be made file by file, or every file
+    # would pay an extra round trip.
+    sources = [
+        _source_uri(p.relative_to(root).as_posix(), container_root) for p in files
+    ]
     try:
-        futures = {
-            executor.submit(runner.run_one, idx, len(files), path): path
-            for idx, path in enumerate(files)
-        }
-        for fut in as_completed(futures):
+        existing = lookup_existing(args.addr, sources)
+    except grpc.RpcError as exc:
+        LOG.error("ListTasks failed: %s: %s", exc.code().name, exc.details())
+        return 2
+    counts = {"success": 0, "failed": 0, "inflight": 0}
+    for source in sources:
+        task = existing.get(source)
+        if task is None:
+            continue
+        if task.status == TaskStatus.TASK_STATUS_SUCCESS:
+            counts["success"] += 1
+        elif task.status == TaskStatus.TASK_STATUS_FAILED:
+            counts["failed"] += 1
+        else:
+            counts["inflight"] += 1
+    LOG.info(
+        "lookup: %d source(s) — %d success (skip), %d failed (requeue), "
+        "%d in flight (attach), %d new (submit)",
+        len(sources),
+        counts["success"],
+        counts["failed"],
+        counts["inflight"],
+        len(sources) - len(existing),
+    )
+
+    cfg: dict[str, Any] = {
+        "run_id": run_id,
+        "addr": args.addr,
+        "root": str(root),
+        "container_root": container_root,
+        "results_dir": str(out_dir / "results"),
+        "no_chunks": args.no_chunks,
+        "poll_interval": args.poll_interval,
+        "poll_max_interval": args.poll_max_interval,
+        "existing": existing,
+    }
+
+    LOG.info(
+        "processing %d file(s) with %d worker(s); timings -> %s",
+        len(files),
+        len(files),
+        out_dir / "files.jsonl",
+    )
+
+    rows: list[dict[str, Any]] = []
+    interrupted = False
+    wall_started = time.monotonic()
+    executor = ThreadPoolExecutor(
+        max_workers=len(files), thread_name_prefix="parse-file"
+    )
+    futures = {
+        executor.submit(_run_file, idx, str(path), cfg): (idx, path)
+        for idx, path in enumerate(files)
+    }
+    try:
+        for finished, fut in enumerate(as_completed(futures), 1):
+            idx, path = futures[fut]
             try:
-                fut.result()
-            except Exception:  # noqa: BLE001 - run_one catches internally; this is a bug
-                LOG.exception("unexpected worker error for %s", futures[fut])
+                row = fut.result()
+            except Exception as exc:  # noqa: BLE001 - a dead worker must not kill the run
+                row = {
+                    "run_id": run_id,
+                    "index": idx,
+                    "doc_id": _make_doc_id(path.relative_to(root).as_posix()),
+                    "path": path.relative_to(root).as_posix(),
+                    "task_id": "",
+                    "source": "",
+                    "action": "",
+                    "status": "failed",
+                    "error": f"worker failed: {type(exc).__name__}: {exc}",
+                    "submitted_at": None,
+                    "started_at": None,
+                    "finished_at": utc_now(),
+                    "submit_s": None,
+                    "queue_s": None,
+                    "exec_s": None,
+                    "total_s": None,
+                    "polls": 0,
+                    "size_bytes": _safe_size(path),
+                    "chunk_count": 0,
+                    "total_pages": 0,
+                    "title": "",
+                    "warning": "",
+                    "result_file": None,
+                }
+            rows.append(row)
+            append_jsonl(out_dir / "files.jsonl", row)
+            LOG.info(
+                "[%d/%d] %-7s %-9s queue=%ss exec=%ss total=%ss chunks=%d  %s%s",
+                finished,
+                len(files),
+                row["status"].upper(),
+                row.get("action", ""),
+                _fmt(row["queue_s"]),
+                _fmt(row["exec_s"]),
+                _fmt(row["total_s"]),
+                row["chunk_count"],
+                row["path"],
+                "" if row["status"] in ("success", "skipped")
+                else f"  ({row['error'][:200]})",
+            )
     except KeyboardInterrupt:
         interrupted = True
-        LOG.warning(
-            "interrupted: cancelling queued files; in-flight requests finish before exit"
-        )
+        LOG.warning("interrupted; queued pollers cancelled, running pollers may continue")
         executor.shutdown(wait=False, cancel_futures=True)
-    finally:
-        if not interrupted:
-            executor.shutdown(wait=True)
-        sampler.stop()
-        reporter.stop()
-        try:
-            reporter.report_once()
-        except Exception:  # noqa: BLE001
-            LOG.exception("final throughput row failed")
+    else:
+        executor.shutdown(wait=True)
 
-        summary = _write_summary(
-            out_dir,
-            run_id,
-            args,
-            files,
-            skipped,
-            skipped_resume,
-            stats,
-            sampler,
-            interrupted,
-            containers,
-            container_root,
-            staged,
-            staged_bytes if staged else 0,
-            started_at,
-        )
+    wall_s = time.monotonic() - wall_started
+    summary = _write_summary(
+        out_dir,
+        run_id,
+        started_at,
+        args,
+        files,
+        skipped,
+        skipped_resume,
+        rows,
+        wall_s,
+        interrupted,
+        containers,
+        container_root,
+        staged,
+        staged_bytes if staged else 0,
+    )
 
-        # Only delete a directory this script created for this run; a
-        # user-provided --container-root is left alone.
-        if (
-            staged
-            and containers
-            and not args.container_root
-            and not args.keep_staged
-        ):
-            cleanup_staged(containers, container_root)
-
-        channel.close()
+    # Only delete a directory this script created for this run; a
+    # user-provided --container-root is left alone.
+    if (
+        staged
+        and containers
+        and not args.container_root
+        and not args.keep_staged
+        and not interrupted
+    ):
+        cleanup_staged(containers, container_root)
 
     outcome = summary["outcome"]
     LOG.info(
-        "done: success=%d failed=%d timeout=%d not_started=%d in %.1fs",
+        "done: success=%d skipped=%d failed=%d not_finished=%d in %.1fs; "
+        "throughput=%.2f files/min",
         outcome["success"],
+        outcome["skipped_existing"],
         outcome["failed"],
-        outcome["timed_out"],
-        outcome["not_started"],
-        summary["throughput"]["elapsed_s"],
+        outcome["not_finished"],
+        summary["throughput"]["wall_s"],
+        summary["throughput"]["files_per_min"] or 0.0,
     )
     LOG.info("results: %s", out_dir.resolve())
-    return 0 if outcome["failed"] == 0 else 1
+    if interrupted:
+        return 130
+    return 0 if outcome["success"] + outcome["skipped_existing"] == len(files) else 1
 
 
 if __name__ == "__main__":

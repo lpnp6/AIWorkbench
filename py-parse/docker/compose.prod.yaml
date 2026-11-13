@@ -7,11 +7,20 @@
 #                           synchronous `file-parse-server` wrapper is not used.
 #
 # py-parse async stack:
-#   - redis               : Celery broker + hot cache for task status
-#   - postgres            : EXTERNAL — provided by the repo-root compose.infra.yaml,
-#                           reached over the AIWorkbench network as "postgres"
+#   - postgres            : EXTERNAL — repo-root compose.infra.yaml (outbox source
+#                           of truth + chunks), reached on AIWorkbench as "postgres"
+#   - cache               : EXTERNAL — repo-root compose.infra.yaml Redis, caches
+#                           chunks in front of Postgres, reached as "cache"
+#   - redis               : Celery broker + result backend
+#   - outbox-dispatcher   : publishes PENDING outbox rows to the Celery queue
 #   - celery-worker       : consumes the queue, runs read -> extract -> chunk
 #   - py-parse            : gRPC control plane (SubmitParse / GetResult), port 50051
+#
+# Submit path: gRPC inserts an outbox row (no broker access) -> dispatcher
+# publishes it -> worker claims it in Postgres (PENDING -> RUNNING, rowcount=1)
+# -> chunks are written to Postgres, cached in Redis, and Celery's result
+# metadata is updated. The outbox status mirrors Celery's state
+# (pending/STARTED/success/failure).
 #
 # Prerequisites:
 #   - Linux or Windows WSL2 (the Docker build of MinerU has no macOS GPU support)
@@ -62,14 +71,32 @@ x-parse-env: &parse-env
   # Per-request HTTP timeout. Large books (300+ page PDFs, image-heavy epubs)
   # routinely need more than the old 300s default on a laptop GPU; when this
   # fires the client abandons a parse that MinerU would otherwise finish and
-  # the task is recorded as failed. Keep it below the benchmark --task-timeout.
+  # the task is recorded as failed. The benchmark waits for the terminal state,
+  # so it never abandons a parse that MinerU would otherwise finish.
   MINERU_TIMEOUT: "${MINERU_TIMEOUT:-1800}"
+  # Celery broker + result backend (execution state only).
   REDIS_URL: redis://redis:6379/0
   # requirements.txt installs psycopg2-binary, so the DSN must use the psycopg2
   # dialect. With postgresql+psycopg:// SQLAlchemy looks for psycopg 3, which is
   # not in the image, and startup fails with ModuleNotFoundError.
   POSTGRES_DSN: postgresql+psycopg2://postgres:postgres@postgres:5432/pyparse
+  # Chunks cache in front of Postgres (shared infra, alias "cache").
+  CACHE_REDIS_URL: redis://cache:6379/0
+  # TTL for cached chunks; a miss falls back to Postgres.
   RESULT_TTL_SECONDS: "3600"
+  # How long a PENDING row's dispatch mark may stay unclaimed before the
+  # dispatcher re-publishes it. Any value shorter than the queue wait turns
+  # every waiting task into a duplicate message every period — with one worker
+  # on a deep backlog the 300s default inflates the broker list by an order of
+  # magnitude. 1800s still bounds the row's wait when the dispatcher dies
+  # between its Postgres stamp and the broker write.
+  OUTBOX_STALE_SECONDS: "${OUTBOX_STALE_SECONDS:-3600}"
+  # How long a RUNNING task's claim may go without a terminal write before the
+  # dispatcher marks it FAILED. A worker killed mid-parse never writes one, and
+  # a redelivered message is only a no-op duplicate, so without this the row
+  # stays RUNNING forever. Must exceed the longest legitimate parse
+  # (MINERU_TIMEOUT + slack), or a slow document is failed under a live worker.
+  RUNNING_TIMEOUT_SECONDS: "${RUNNING_TIMEOUT_SECONDS:-3600}"
   # Optional: uncomment and fill in to enable the minio/s3 storage backends.
   # MINIO_ENDPOINT: minio:9000
   # MINIO_ACCESS_KEY: ...
@@ -92,6 +119,28 @@ services:
       # Weights are baked into the image; nothing is downloaded at runtime.
       MINERU_MODEL_SOURCE: local
       TZ: Asia/Shanghai
+      # glibc keeps freed heap pages in its arenas instead of returning them to
+      # the kernel, so the api-server's RSS only ever ratchets up. MinerU calls
+      # trim_process_heap() at every processing-window boundary and at document
+      # close, but it returns immediately unless this switch is on.
+      # A/B on one 196-page PDF at MINERU_CONCURRENCY=1:
+      #   off -> container parks at ~10.5GB after the parse and never comes
+      #          down (still 11.0GB 45min later, idle); api-server RSS 7.0GB
+      #   on  -> drops 1.8-2.7GB at each 64-page window boundary, settles at
+      #          7.55GB and stays flat; api-server RSS 2.7GB
+      # Peak is unchanged (~10.5GB) because trim only runs between windows: it
+      # lowers the baseline, not the transient working set (~3GB). That matters
+      # only if more than one document is in flight. With WORKER_REPLICAS=1 and
+      # CELERY_WORKER_CONCURRENCY=1 exactly one parse runs at a time, so
+      # --concurrency on mineru-api never runs two documents. Scale workers and
+      # each extra concurrent parse adds ~3GB on top of the 7.5GB baseline.
+      MINERU_MALLOC_TRIM: "${MINERU_MALLOC_TRIM:-1}"
+      # glibc creates up to 8 arenas per core by default; a threaded service
+      # ends up with thousands of mappings and an inflated RSS. Two arenas is
+      # enough for the render threads and keeps fragmentation bounded.
+      # Measured together with the switch above -- its isolated effect is not
+      # separated by that A/B.
+      MALLOC_ARENA_MAX: "${MALLOC_ARENA_MAX:-2}"
     entrypoint: ["mineru-kit"]
     command:
       - api-server
@@ -116,6 +165,8 @@ services:
               count: all
               capabilities: [gpu]
 
+  # Celery broker + result backend. Business status/chunks live in Postgres and
+  # the shared cache, never here.
   redis:
     image: redis:7-alpine
     container_name: py-parse-redis
@@ -130,8 +181,23 @@ services:
       timeout: 5s
       retries: 5
 
+  # Outbox relay: scans Postgres for PENDING rows and publishes them to Celery.
+  # Multiple replicas are safe: fetch_undispatched uses SKIP LOCKED, and the
+  # worker's claim dedups a stale re-publish.
+  outbox-dispatcher:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: always
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *parse-env
+    command: python -m py_parse.adapters.queue.dispatcher
+
   # Async parsing worker: consumes the Redis queue, runs read -> extract -> chunk,
-  # and writes Postgres + Redis.
+  # claims the outbox row in Postgres, then writes chunks to Postgres + cache.
   celery-worker:
     build:
       context: ..

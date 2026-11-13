@@ -54,6 +54,16 @@ class ParseServiceStub:
                 request_serializer=parse__pb2.GetResultRequest.SerializeToString,
                 response_deserializer=parse__pb2.GetResultResponse.FromString,
                 _registered_method=True)
+        self.RequeueParse = channel.unary_unary(
+                '/parse.v1.ParseService/RequeueParse',
+                request_serializer=parse__pb2.RequeueParseRequest.SerializeToString,
+                response_deserializer=parse__pb2.RequeueParseResponse.FromString,
+                _registered_method=True)
+        self.ListTasks = channel.unary_unary(
+                '/parse.v1.ParseService/ListTasks',
+                request_serializer=parse__pb2.ListTasksRequest.SerializeToString,
+                response_deserializer=parse__pb2.ListTasksResponse.FromString,
+                _registered_method=True)
 
 
 class ParseServiceServicer:
@@ -71,6 +81,8 @@ class ParseServiceServicer:
 
     def SubmitParse(self, request, context):
         """Enqueue a parse task. Returns immediately with a task_id for polling.
+        One task per source: a submit whose source already has a task (any status)
+        is rejected with ALREADY_EXISTS. Retry a FAILED task with RequeueParse.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -78,6 +90,26 @@ class ParseServiceServicer:
 
     def GetResult(self, request, context):
         """Poll task status and (once SUCCESS) fetch the parsed chunks.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RequeueParse(self, request, context):
+        """Retry a FAILED task by creating a NEW task for the same document. The
+        original record is never mutated: its status and error stay as they were,
+        and the response carries the id of the new task to poll.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListTasks(self, request, context):
+        """List tasks of every status, newest first, deduplicated by source: a source
+        may have several rows (each retry adds one and leaves the old one), and
+        only the row with the most recent status is reported. An optional source
+        list narrows the report to those sources, which is how a caller decides
+        per source whether to submit, skip or requeue.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -95,6 +127,16 @@ def add_ParseServiceServicer_to_server(servicer, server):
                     servicer.GetResult,
                     request_deserializer=parse__pb2.GetResultRequest.FromString,
                     response_serializer=parse__pb2.GetResultResponse.SerializeToString,
+            ),
+            'RequeueParse': grpc.unary_unary_rpc_method_handler(
+                    servicer.RequeueParse,
+                    request_deserializer=parse__pb2.RequeueParseRequest.FromString,
+                    response_serializer=parse__pb2.RequeueParseResponse.SerializeToString,
+            ),
+            'ListTasks': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListTasks,
+                    request_deserializer=parse__pb2.ListTasksRequest.FromString,
+                    response_serializer=parse__pb2.ListTasksResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -161,6 +203,60 @@ class ParseService:
             '/parse.v1.ParseService/GetResult',
             parse__pb2.GetResultRequest.SerializeToString,
             parse__pb2.GetResultResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RequeueParse(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/parse.v1.ParseService/RequeueParse',
+            parse__pb2.RequeueParseRequest.SerializeToString,
+            parse__pb2.RequeueParseResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListTasks(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/parse.v1.ParseService/ListTasks',
+            parse__pb2.ListTasksRequest.SerializeToString,
+            parse__pb2.ListTasksResponse.FromString,
             options,
             channel_credentials,
             insecure,

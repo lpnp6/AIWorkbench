@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package parse.v1;
 
+import "google/protobuf/timestamp.proto";
+
 // py-parser's external service contract (gRPC, async task model).
 //
 // Design points:
@@ -14,9 +16,21 @@ package parse.v1;
 //     (endpoints / credentials) lives in the config center, never in the request.
 service ParseService {
   // Enqueue a parse task. Returns immediately with a task_id for polling.
+  // One task per source: a submit whose source already has a task (any status)
+  // is rejected with ALREADY_EXISTS. Retry a FAILED task with RequeueParse.
   rpc SubmitParse(ParseRequest) returns (SubmitParseResponse);
   // Poll task status and (once SUCCESS) fetch the parsed chunks.
   rpc GetResult(GetResultRequest) returns (GetResultResponse);
+  // Retry a FAILED task by creating a NEW task for the same document. The
+  // original record is never mutated: its status and error stay as they were,
+  // and the response carries the id of the new task to poll.
+  rpc RequeueParse(RequeueParseRequest) returns (RequeueParseResponse);
+  // List tasks of every status, newest first, deduplicated by source: a source
+  // may have several rows (each retry adds one and leaves the old one), and
+  // only the row with the most recent status is reported. An optional source
+  // list narrows the report to those sources, which is how a caller decides
+  // per source whether to submit, skip or requeue.
+  rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
 }
 
 message ParseRequest {
@@ -75,4 +89,38 @@ message DocMeta {
   int32 total_pages = 1;
   string title = 2;
   string warning = 3;
+}
+
+message RequeueParseRequest {
+  // The FAILED task to retry. Only FAILED tasks are accepted.
+  string task_id = 1;
+}
+
+message RequeueParseResponse {
+  // The newly created task (initially PENDING). Poll GetResult with this id.
+  string task_id = 1;
+  // The FAILED task this one retries, kept for lineage.
+  string requeued_from = 2;
+}
+
+message ListTasksRequest {
+  // Optional filter: only tasks whose source is one of these URIs are
+  // returned. Empty means "every source".
+  repeated string sources = 1;
+}
+
+message ListTasksResponse {
+  repeated TaskSummary tasks = 1;
+}
+
+// One task per source: the row carrying that source's most recent status.
+message TaskSummary {
+  string task_id = 1;
+  string doc_id = 2;
+  string source = 3;
+  TaskStatus status = 4;
+  // Set only when status == FAILED.
+  string error = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp updated_at = 7;
 }

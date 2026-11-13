@@ -14,6 +14,11 @@ class TaskQueue(ABC):
 
     @abstractmethod
     def enqueue(self, task_id: str, doc_id: str, source: str) -> None:
-        """Enqueue a parse task for execution. `task_id` is the caller-assigned
-        business id (also used as the queue's own task id for traceability)."""
+        """Enqueue a parse task for execution.
+
+        `task_id` is the caller-assigned business id and travels in the message
+        body; the adapter generates a fresh message id per publish, so a
+        duplicate publish keeps its own result record and can never overwrite
+        the result of the publish that did the work.
+        """
         raise NotImplementedError

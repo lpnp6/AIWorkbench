@@ -1,8 +1,15 @@
-"""SQLAlchemy models + engine for the durable task/result store (PostgreSQL).
+"""SQLAlchemy models + engine for the outbox task store (PostgreSQL).
 
-`tasks` is the source of truth for task status + doc_meta; `chunks` holds the
-parsed chunks for each task. The Redis cache may expire its status keys, but
-these rows survive — that is the durability fallback for polling.
+`outbox_tasks` is both the domain task record and the outbox: a PENDING row is
+the event that the dispatcher must publish to Celery. `chunks` holds the parsed
+chunks; Redis only caches them.
+
+Status values mirror Celery's execution states so the two sides stay in sync:
+
+    PENDING  ↔ queued (no Celery result key yet)
+    RUNNING  ↔ STARTED
+    SUCCESS  ↔ SUCCESS
+    FAILED   ↔ FAILURE
 """
 from __future__ import annotations
 
@@ -24,8 +31,11 @@ class Base(DeclarativeBase):
     pass
 
 
-class TaskRow(Base):
-    __tablename__ = "tasks"
+class OutboxTaskRow(Base):
+    __tablename__ = "outbox_tasks"
+    # The dispatcher scans PENDING rows by (dispatched_at, created_at); the
+    # worker claims by task_id alone.
+    __table_args__ = (Index("ix_outbox_dispatch", "status", "dispatched_at", "created_at"),)
 
     task_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     doc_id: Mapped[str] = mapped_column(String(256))
@@ -35,6 +45,16 @@ class TaskRow(Base):
     total_pages: Mapped[int | None] = mapped_column(nullable=True)
     title: Mapped[str | None] = mapped_column(Text)
     warning: Mapped[str | None] = mapped_column(Text)
+    # NULL = not published yet (or publish failed and was rolled back). Stale
+    # non-NULL values are re-published; the worker's atomic claim dedups them.
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime)
+    # Set by the PENDING -> RUNNING claim. The dispatcher fails a RUNNING row
+    # whose claim is older than the running timeout: a worker killed between
+    # the claim and its terminal write would otherwise park the row forever.
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    # Set when this row is a retry of an earlier task. Requeueing never touches
+    # the original row, so the lineage lives on the new one.
+    requeued_from: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
@@ -47,7 +67,7 @@ class ChunkRow(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     task_id: Mapped[str] = mapped_column(
-        ForeignKey("tasks.task_id", ondelete="CASCADE"), index=True
+        ForeignKey("outbox_tasks.task_id", ondelete="CASCADE"), index=True
     )
     seq: Mapped[int] = mapped_column()
     chunk_id: Mapped[str] = mapped_column(String(256))

@@ -76,9 +76,9 @@ def build_parser(settings: Settings) -> DocumentParser:
 
 
 def build_store(settings: Settings) -> TaskStore:
-    """Construct the task store (Redis hot cache + PostgreSQL durable store)."""
-    redis_client = redis_lib.Redis.from_url(settings.redis_url, decode_responses=True)
+    """Construct the outbox store (PostgreSQL) with its chunks cache (Redis)."""
+    cache = redis_lib.Redis.from_url(settings.cache_redis_url, decode_responses=True)
     engine = create_engine_from_dsn(settings.postgres_dsn)
     init_db(engine)
     session_factory = make_session_factory(engine)
-    return RedisPostgresTaskStore(redis_client, session_factory, settings.result_ttl_seconds)
+    return RedisPostgresTaskStore(cache, session_factory, settings.result_ttl_seconds)

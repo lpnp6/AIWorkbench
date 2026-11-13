@@ -44,3 +44,12 @@ class DocumentExtractor(ABC):
         extension to select a parser. Raises DocumentExtractError on failure.
         """
         raise NotImplementedError
+
+    def health(self) -> bool:
+        """Best-effort liveness probe of the backing engine; never raises.
+
+        The default assumes the engine is reachable. Adapters that talk to an
+        independent service (the MinerU HTTP client) override it so callers
+        can defer work while that service is down.
+        """
+        return True

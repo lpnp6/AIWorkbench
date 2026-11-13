@@ -27,6 +27,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import random
 import time
 import zipfile
 from typing import Any
@@ -83,7 +84,9 @@ class MineruClient(DocumentExtractor):
 
     def extract(self, data: bytes, filename: str) -> list[dict]:
         deadline = time.monotonic() + self._job_timeout
-        task_id, upload = self._create_task(_normalize_filename(filename), len(data))
+        task_id, upload = self._create_task(
+            _normalize_filename(filename), len(data), deadline
+        )
         try:
             self._upload(upload, data)
             result_url = self._wait_for_result(task_id, deadline)
@@ -102,16 +105,43 @@ class MineruClient(DocumentExtractor):
 
     # -- Task lifecycle ----------------------------------------------------
 
-    def _create_task(self, filename: str, size: int) -> tuple[str, dict]:
+    def _create_task(
+        self, filename: str, size: int, deadline: float
+    ) -> tuple[str, dict]:
         payload = {
             "files": [{"file_name": filename, "bytes": size}],
             "output_formats": [_OUTPUT_FORMATS],
         }
-        try:
-            resp = self._client.post(f"{self._base_url}{_TASKS_PATH}", json=payload)
-            resp.raise_for_status()
-        except httpx.HTTPError as e:
-            raise DocumentExtractError(f"mineru-api create task failed: {e}") from e
+        # mineru-api answers 202 once its engine is ready. Refused connections
+        # and 5xx (model still loading after a restart) are transient: the
+        # document has not even been sent yet, so retry until the job deadline
+        # instead of failing a task that MinerU never saw.
+        delay = self._poll_initial
+        while True:
+            try:
+                resp = self._client.post(f"{self._base_url}{_TASKS_PATH}", json=payload)
+                resp.raise_for_status()
+                break
+            except httpx.HTTPStatusError as e:
+                code = e.response.status_code
+                if code != 429 and code < 500:
+                    raise DocumentExtractError(
+                        f"mineru-api create task failed: {e}"
+                    ) from e
+                logger.warning("mineru-api create failed (HTTP %s); retrying", code)
+            except httpx.HTTPError as e:
+                logger.warning("mineru-api create task failed (%s); retrying", e)
+            if time.monotonic() >= deadline:
+                raise DocumentExtractError(
+                    f"mineru-api create task failed: not ready within "
+                    f"{self._job_timeout:.0f}s"
+                )
+            # Equal jitter. A deterministic sleep keeps every worker that began
+            # retrying during the same outage on the same phase, so they all
+            # POST at once the moment the engine recovers. Randomising each
+            # wait inside [delay/2, delay] breaks that lockstep.
+            time.sleep(delay / 2 + random.uniform(0, delay / 2))
+            delay = min(delay * 1.5, self._poll_max)
 
         try:
             body = resp.json()
